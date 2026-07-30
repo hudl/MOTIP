@@ -2,9 +2,9 @@
 
 Our codebase is built upon **Python 3.12, PyTorch 2.4.0 (recommended)**. 
 
-:warning: As far as I know, due to the use of some new language features in our code, Python version 3.10 or higher is required. For PyTorch, because there have been changes in the type requirements for attention masks, PyTorch version 2.0 or higher is needed.
+:warning: As far as I know, due to the use of some new language features in our code, **Python version 3.10 or higher is required**. For PyTorch, because there have been changes in the type requirements for attention masks, **PyTorch version 2.0 or higher is needed**.
 
-:construction: We plan to support lower versions of PyTorch in the future, but the exact timeline is yet to be determined. Currently, we do not have sufficient manpower to address this issue.
+~~:construction: We plan to support lower versions of PyTorch in the future, but the exact timeline is yet to be determined. Currently, we do not have sufficient manpower to address this issue.~~
 
 ## Setup scripts
 
