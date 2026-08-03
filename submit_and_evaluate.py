@@ -99,6 +99,7 @@ def submit_and_evaluate(config: dict):
         inference_only_detr=config["INFERENCE_ONLY_DETR"] if config["INFERENCE_ONLY_DETR"] is not None
         else config["ONLY_DETR"],
         dtype=config.get("INFERENCE_DTYPE", "FP32"),
+        max_tracks=config.get("MAX_TRACKS", 0),
     )
 
     if metrics is not None:
@@ -136,6 +137,7 @@ def submit_and_evaluate_one_model(
         area_thresh: int = 0,
         inference_only_detr: bool = False,
         dtype: str = "FP32",
+        max_tracks: int = 0,
 ):
     # Build the datasets:
     inference_dataset = dataset_classes[dataset](
@@ -206,6 +208,7 @@ def submit_and_evaluate_one_model(
             area_thresh=area_thresh,
             only_detr=inference_only_detr,
             dtype=dtype,
+            max_tracks=max_tracks,
         )
         if is_fake:
             logger.info(
@@ -232,7 +235,7 @@ def submit_and_evaluate_one_model(
                     sequence_tracker_results.append(
                         f"{t + 1},{obj_id.item()},"
                         f"{bbox[0].item()},{bbox[1].item()},{bbox[2].item()},{bbox[3].item()},"
-                        f"1,-1,-1,-1\n"
+                        f"{score.item():.4f},-1,-1,-1\n"
                     )
             if not is_fake:
                 os.makedirs(os.path.join(outputs_dir, "tracker"), exist_ok=True)

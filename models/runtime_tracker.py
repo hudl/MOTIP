@@ -21,6 +21,7 @@ class RuntimeTracker:
             use_sigmoid: bool = False,
             assignment_protocol: str = "hungarian",
             miss_tolerance: int = 30,
+            max_tracks: int = 0,
             det_thresh: float = 0.5,
             newborn_thresh: float = 0.5,
             id_thresh: float = 0.1,
@@ -43,6 +44,7 @@ class RuntimeTracker:
         self.use_sigmoid = use_sigmoid
         self.assignment_protocol = assignment_protocol.lower()
         self.miss_tolerance = miss_tolerance
+        self.max_tracks = max_tracks
         self.det_thresh = det_thresh
         self.newborn_thresh = newborn_thresh
         self.id_thresh = id_thresh
@@ -97,7 +99,42 @@ class RuntimeTracker:
         else:
             id_pred_labels = self._get_id_pred_labels(boxes=boxes, output_embeds=output_embeds)
         # Filter out illegal newborn detections:
-        keep_idxs = (id_pred_labels != self.num_id_vocabulary) | (scores > self.newborn_thresh)
+        n_active = self.trajectory_id_labels.shape[1] if self.trajectory_id_labels.shape[0] > 0 else 0
+        if self.max_tracks > 0 and n_active >= self.max_tracks:
+            # Force-assign newborns to best existing track instead of dropping
+            newborn_mask = (id_pred_labels == self.num_id_vocabulary)
+            if newborn_mask.any() and hasattr(self, '_last_id_scores') and self._last_id_scores is not None:
+                trajectory_id_labels_set = set(self.trajectory_id_labels[0].tolist())
+                # IDs already claimed by non-newborn detections in this frame
+                already_assigned = set()
+                for i in range(len(id_pred_labels)):
+                    if id_pred_labels[i].item() != self.num_id_vocabulary:
+                        already_assigned.add(id_pred_labels[i].item())
+                valid_ids = sorted(trajectory_id_labels_set - already_assigned)
+                if valid_ids:
+                    # Greedy: assign each newborn to best available ID, removing it from pool
+                    newborn_idxs = newborn_mask.nonzero(as_tuple=False).squeeze(-1)
+                    if newborn_idxs.dim() == 0:
+                        newborn_idxs = newborn_idxs.unsqueeze(0)
+                    for idx in newborn_idxs:
+                        if not valid_ids:
+                            break
+                        id_scores_row = self._last_id_scores[idx]
+                        best_score = -1.0
+                        best_id = None
+                        for vid in valid_ids:
+                            if vid < id_scores_row.shape[0]:
+                                s = id_scores_row[vid].item()
+                                if s > best_score:
+                                    best_score = s
+                                    best_id = vid
+                        if best_id is not None and best_score > self.id_thresh:
+                            id_pred_labels[idx] = best_id
+                            valid_ids.remove(best_id)
+            # Now apply normal newborn filter (remaining unassigned newborns get dropped)
+            keep_idxs = (id_pred_labels != self.num_id_vocabulary) | (scores > self.newborn_thresh)
+        else:
+            keep_idxs = (id_pred_labels != self.num_id_vocabulary) | (scores > self.newborn_thresh)
         scores = scores[keep_idxs]
         categories = categories[keep_idxs]
         boxes = boxes[keep_idxs]
@@ -220,6 +257,7 @@ class RuntimeTracker:
                 case _: raise NotImplementedError
 
             id_pred_labels = torch.tensor(id_labels, dtype=torch.int64, device=distributed_device())
+            self._last_id_scores = id_scores
             return id_pred_labels
 
     def _assign_newborn_id_labels(self, pred_id_labels: torch.Tensor):

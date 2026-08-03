@@ -77,6 +77,7 @@ def train_engine(config: dict):
         sample_intervals=config["SAMPLE_INTERVALS"],
         length_per_iteration=config["LENGTH_PER_ITERATION"],
         data_weights=data_weights,
+        sample_stride=config.get("SAMPLE_STRIDE", 1),
     )
     # Build training data loader:
     train_dataloader = DataLoader(
@@ -97,14 +98,15 @@ def train_engine(config: dict):
 
     # Build MOTIP model:
     model, detr_criterion = build_motip(config=config)
-    # Load the pre-trained DETR:
-    load_detr_pretrain(
-        model=model, pretrain_path=config["DETR_PRETRAIN"], num_classes=config["NUM_CLASSES"],
-        default_class_idx=config["DETR_DEFAULT_CLASS_IDX"] if "DETR_DEFAULT_CLASS_IDX" in config else None,
-    )
-    logger.success(
-        log=f"Load the pre-trained DETR from '{config['DETR_PRETRAIN']}'. "
-    )
+    # Load the pre-trained DETR (skip if DETR_PRETRAIN is None, e.g. resume runs):
+    if config["DETR_PRETRAIN"] is not None:
+        load_detr_pretrain(
+            model=model, pretrain_path=config["DETR_PRETRAIN"], num_classes=config["NUM_CLASSES"],
+            default_class_idx=config["DETR_DEFAULT_CLASS_IDX"] if "DETR_DEFAULT_CLASS_IDX" in config else None,
+        )
+        logger.success(
+            log=f"Load the pre-trained DETR from '{config["DETR_PRETRAIN"]}'. "
+        )
     # Build Loss Function:
     id_criterion = build_id_criterion(config=config)
 

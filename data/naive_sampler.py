@@ -19,6 +19,7 @@ class NaiveSampler(Sampler):
             sample_mode: str = "random_interval",
             seed: int = 1025,
             data_weights: dict | None = None,
+            sample_stride: int = 1,
     ):
         super().__init__()
         self.data_source = data_source
@@ -29,6 +30,7 @@ class NaiveSampler(Sampler):
         self.sample_mode = sample_mode
         self.seed = seed
         self.data_weights = data_weights
+        self.sample_stride = sample_stride
         # Check for these parameters:
         assert len(sample_steps) == len(sample_lengths) == len(sample_intervals), \
             "The lengths of sample_steps, sample_lengths, and sample_intervals should be the same."
@@ -112,6 +114,9 @@ class NaiveSampler(Sampler):
                                             "sequence": sequence_name,
                                             "frame_idxs": frame_idxs,
                                         })
+        # Apply stride to subsample valid starts (reduces steps/epoch without changing clip length).
+        if self.sample_stride > 1:
+            sample_infos = sample_infos[::self.sample_stride]
         total_len = len(sample_infos)
         # Shuffle the samples
         # and only keep the first "total_len // (sample_length / self.length_per_iteration)" samples:
