@@ -7,7 +7,7 @@ from scipy.optimize import linear_sum_assignment
 from structures.instances import Instances
 from structures.ordered_set import OrderedSet
 from utils.misc import distributed_device
-from utils.box_ops import box_cxcywh_to_xywh
+from utils.box_ops import box_cxcywh_to_xywh, box_cxcywh_to_xyxy
 from models.misc import get_model
 
 
@@ -27,6 +27,7 @@ class RuntimeTracker:
             id_thresh: float = 0.1,
             area_thresh: int = 0,
             only_detr: bool = False,
+            max_displacement_bh: float = 0.0,
             dtype: torch.dtype = torch.float32,
     ):
         self.model = model
@@ -50,6 +51,7 @@ class RuntimeTracker:
         self.id_thresh = id_thresh
         self.area_thresh = area_thresh
         self.only_detr = only_detr
+        self.max_displacement_bh = max_displacement_bh
         self.num_id_vocabulary = get_model(model).num_id_vocabulary
 
         # Check for the legality of settings:
@@ -91,13 +93,36 @@ class RuntimeTracker:
         return
 
     @torch.no_grad()
-    def update(self, image):
+    def update(self, image, suppress_boxes=None):
         detr_out = self.model(frames=image, part="detr")
         scores, categories, boxes, output_embeds = self._get_activate_detections(detr_out=detr_out)
+        # Suppress detections matching goalkeeper boxes
+        if suppress_boxes is not None and len(suppress_boxes) > 0 and len(boxes) > 0:
+            boxes_xyxy = box_cxcywh_to_xyxy(boxes) * self.bbox_unnorm
+            suppress_t = torch.tensor(suppress_boxes, dtype=boxes_xyxy.dtype, device=boxes_xyxy.device)
+            keep = torch.ones(len(boxes_xyxy), dtype=torch.bool, device=boxes_xyxy.device)
+            for i in range(len(boxes_xyxy)):
+                for j in range(len(suppress_t)):
+                    inter_x1 = torch.max(boxes_xyxy[i, 0], suppress_t[j, 0])
+                    inter_y1 = torch.max(boxes_xyxy[i, 1], suppress_t[j, 1])
+                    inter_x2 = torch.min(boxes_xyxy[i, 2], suppress_t[j, 2])
+                    inter_y2 = torch.min(boxes_xyxy[i, 3], suppress_t[j, 3])
+                    inter = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
+                    area_a = (boxes_xyxy[i, 2] - boxes_xyxy[i, 0]) * (boxes_xyxy[i, 3] - boxes_xyxy[i, 1])
+                    area_b = (suppress_t[j, 2] - suppress_t[j, 0]) * (suppress_t[j, 3] - suppress_t[j, 1])
+                    iou_val = inter / (area_a + area_b - inter + 1e-6)
+                    if iou_val > 0.5:
+                        keep[i] = False
+                        break
+            scores = scores[keep]
+            categories = categories[keep]
+            boxes = boxes[keep]
+            output_embeds = output_embeds[keep]
         if self.only_detr:
             id_pred_labels = self.num_id_vocabulary * torch.ones(boxes.shape[0], dtype=torch.int64, device=boxes.device)
         else:
             id_pred_labels = self._get_id_pred_labels(boxes=boxes, output_embeds=output_embeds)
+
         # Filter out illegal newborn detections:
         n_active = self.trajectory_id_labels.shape[1] if self.trajectory_id_labels.shape[0] > 0 else 0
         if self.max_tracks > 0 and n_active >= self.max_tracks:
@@ -251,7 +276,7 @@ class RuntimeTracker:
             # Different assignment protocols:
             match self.assignment_protocol:
                 case "hungarian": id_labels = self._hungarian_assignment(id_scores=id_scores)
-                case "object-max": id_labels = self._object_max_assignment(id_scores=id_scores)
+                case "object-max": id_labels = self._object_max_assignment(id_scores=id_scores, boxes=boxes)
                 case "id-max": id_labels = self._id_max_assignment(id_scores=id_scores)
                 # case "object-priority": id_labels = self._object_priority_assignment(id_scores=id_scores)
                 case _: raise NotImplementedError
@@ -382,19 +407,74 @@ class RuntimeTracker:
                 id_labels.append(_id)
         return id_labels
 
-    def _object_max_assignment(self, id_scores: torch.Tensor):
+    def _object_max_assignment(self, id_scores: torch.Tensor, boxes: torch.Tensor = None):
         id_labels = list()  # final ID labels
         trajectory_id_labels_set = set(self.trajectory_id_labels[0].tolist())   # all tracked ID labels
 
         object_max_confs, object_max_id_labels = torch.max(id_scores, dim=-1)   # get the target ID labels and confs
+
+        # Spatial tiebreaker: when multiple detections want the same label with
+        # near-equal confidence, prefer the one closest to the track's last position.
+        if boxes is not None and self.trajectory_boxes.shape[0] > 0:
+            last_traj_boxes = self.trajectory_boxes[-1]  # (N_traj, 4) cxcywh normalized
+            last_traj_labels = self.trajectory_id_labels[-1]  # (N_traj,)
+            last_traj_masks = self.trajectory_masks[-1]  # (N_traj,) True=missing
+
+            # Group detections by their argmax label
+            label_to_dets = dict()
+            for i in range(len(object_max_id_labels)):
+                lbl = object_max_id_labels[i].item()
+                if lbl == self.num_id_vocabulary or lbl not in trajectory_id_labels_set:
+                    continue
+                if lbl not in label_to_dets:
+                    label_to_dets[lbl] = []
+                label_to_dets[lbl].append((i, object_max_confs[i].item()))
+
+            # For labels claimed by multiple detections with near-equal conf, pick closest
+            TIEBREAK_MARGIN = 0.05
+            for lbl, dets in label_to_dets.items():
+                if len(dets) < 2:
+                    continue
+                dets.sort(key=lambda x: -x[1])  # sort by conf descending
+                top_conf = dets[0][1]
+                # Check if runner-up is within margin
+                if dets[1][1] >= top_conf - TIEBREAK_MARGIN:
+                    # Find track's last known position
+                    match_mask = (last_traj_labels == lbl)
+                    if not match_mask.any():
+                        continue
+                    traj_idx = match_mask.nonzero(as_tuple=False)[0].item()
+                    if last_traj_masks[traj_idx]:
+                        continue  # track was missing last frame, can't use position
+                    traj_box = last_traj_boxes[traj_idx]
+                    traj_cx = traj_box[0] * self.bbox_unnorm[0]
+                    traj_cy = traj_box[1] * self.bbox_unnorm[1]
+
+                    # Find closest detection among tied candidates
+                    best_idx = None
+                    best_dist = float('inf')
+                    for det_i, det_conf in dets:
+                        if det_conf < top_conf - TIEBREAK_MARGIN:
+                            break  # below margin
+                        det_cx = boxes[det_i, 0] * self.bbox_unnorm[0]
+                        det_cy = boxes[det_i, 1] * self.bbox_unnorm[1]
+                        dist = ((det_cx - traj_cx)**2 + (det_cy - traj_cy)**2)**0.5
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_idx = det_i
+
+                    # Promote the closest detection to be the "max" by boosting its conf
+                    if best_idx is not None and best_idx != dets[0][0]:
+                        object_max_confs[best_idx] = top_conf + 1e-4
+                        # Demote the original winner
+                        object_max_confs[dets[0][0]] = top_conf - 1e-4
+
         # Get the max confs of each ID label:
         id_max_confs = dict()
         for conf, id_label in zip(object_max_confs.tolist(), object_max_id_labels.tolist()):
             if id_label not in id_max_confs:
                 id_max_confs[id_label] = conf
             else:
-                # if conf == id_max_confs[id_label]:  # a very rare case
-                #     conf = conf - 0.0001
                 id_max_confs[id_label] = max(id_max_confs[id_label], conf)
         if self.num_id_vocabulary in id_max_confs:
             id_max_confs[self.num_id_vocabulary] = 0.0  # special token
