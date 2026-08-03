@@ -12,6 +12,9 @@ from .dancetrack import DanceTrack
 from .sportsmot import SportsMOT
 from .crowdhuman import CrowdHuman
 from .bft import BFT
+from .hockey import Hockey
+from .amf_detection import AMFDetection
+from .amf_tracking import AMFTracking
 
 
 dataset_classes = {
@@ -19,6 +22,9 @@ dataset_classes = {
     "SportsMOT": SportsMOT,
     "CrowdHuman": CrowdHuman,
     "BFT": BFT,
+    "Hockey": Hockey,
+    "AMFDetection": AMFDetection,
+    "AMFTracking": AMFTracking,
 }
 
 
