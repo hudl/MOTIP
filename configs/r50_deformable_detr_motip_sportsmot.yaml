@@ -1,4 +1,4 @@
-SUPER_CONFIG_PATH: /workspaces/sip-tracking-experiments/third_party/MOTIP/configs/r50_deformable_detr_motip_dancetrack.yaml
+SUPER_CONFIG_PATH: configs/r50_deformable_detr_motip_dancetrack.yaml
 
 DATASETS: [SportsMOT]
 DATASET_SPLITS: [train]
