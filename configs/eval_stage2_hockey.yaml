@@ -1,0 +1,13 @@
+SUPER_CONFIG_PATH: ./configs/r50_deformable_detr_motip_sportsmot.yaml
+
+DATASETS: [Hockey]
+DATASET_SPLITS: [train]
+
+NUM_CLASSES: 1
+MISS_TOLERANCE: 60
+DET_THRESH: 0.3
+
+INFERENCE_DATASET: Hockey
+INFERENCE_SPLIT: val
+INFERENCE_MODE: submit
+INFERENCE_ONLY_DETR:

@@ -1,0 +1,50 @@
+SUPER_CONFIG_PATH: ./configs/r50_deformable_detr_motip_sportsmot.yaml
+
+# Dataset: crossing-focused sequences from golden_50
+DATA_ROOT: /mnt/s3files/faceoff/tracking_workgroup/tracking_experiments/motip_crossing_dataset
+DATASETS: [Hockey]
+DATASET_SPLITS: [train]
+
+NUM_CLASSES: 1
+
+# Resume from stage2 hockey checkpoint (skip DETR pretrain since we have full model)
+DETR_PRETRAIN:
+RESUME_MODEL: /workspaces/sip-tracking-experiments/third_party/MOTIP/outputs/motip_amf_stage2_v1/stage2_g7e_checkpoint_12.pth
+RESUME_OPTIMIZER: False
+RESUME_SCHEDULER: False
+RESUME_STATES: False
+
+# Training: short fine-tune, lower LR to avoid catastrophic forgetting
+EPOCHS: 21
+LR: 2.0e-5
+LR_BACKBONE_SCALE: 0.05
+SCHEDULER_MILESTONES: [18, 20]
+SAVE_CHECKPOINT_PER_EPOCH: 1
+
+# Sampling: match training domain exactly
+SAMPLE_INTERVALS: [4]
+SAMPLE_LENGTHS: [20]
+
+# Inference settings for val evaluation
+INFERENCE_DATASET:
+INFERENCE_SPLIT: val
+INFERENCE_MODE: submit
+
+MISS_TOLERANCE: 60
+DET_THRESH: 0.3
+NEWBORN_THRESH: 0.6
+
+# Outputs
+OUTPUTS_DIR: /workspaces/sip-tracking-experiments/third_party/MOTIP/outputs/motip_crossing_finetune_v1
+EXP_NAME: crossing_finetune_v1
+USE_WANDB: False
+
+# Disable color jitter (torchvision API incompatibility with make_params)
+AUG_BRIGHTNESS: 0.0
+AUG_CONTRAST: 0.0
+AUG_SATURATION: 0.0
+AUG_HUE: 0.0
+
+# Disable trajectory augmentations (were 0.5 — sabotaged identity learning)
+AUG_TRAJECTORY_OCCLUSION_PROB: 0.0
+AUG_TRAJECTORY_SWITCH_PROB: 0.0

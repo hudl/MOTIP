@@ -1,0 +1,5 @@
+SUPER_CONFIG_PATH: ./configs/pretrain_r50_deformable_detr_hockey_smoketest.yaml
+
+INFERENCE_DATASET: Hockey
+INFERENCE_SPLIT: val
+INFERENCE_MODE: evaluate

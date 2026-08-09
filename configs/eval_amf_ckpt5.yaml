@@ -1,0 +1,15 @@
+SUPER_CONFIG_PATH: ./configs/r50_deformable_detr_motip_amf.yaml
+
+INFERENCE_DATASET: AMFTracking
+INFERENCE_SPLIT: train
+INFERENCE_MODEL: /workspaces/sip-tracking-experiments/third_party/MOTIP/outputs/motip_amf_stage2_v1/checkpoint_5.pth
+INFERENCE_MODE: evaluate
+INFERENCE_MAX_LONGER: 1536
+
+DATA_ROOT: /tmp/amfb_eval
+OUTPUTS_DIR: /tmp/amfb_eval_out_ckpt5
+
+DET_THRESH: 0.3
+NEWBORN_THRESH: 0.3
+ID_THRESH: 0.1
+MISS_TOLERANCE: 30

@@ -1,0 +1,25 @@
+SUPER_CONFIG_PATH: /workspaces/sip-tracking-experiments/third_party/MOTIP/configs/r50_deformable_detr_motip_sportsmot.yaml
+
+DATASETS: [AMFTracking]
+DATASET_SPLITS: [train]
+
+# No val split wired yet.
+INFERENCE_DATASET:
+
+# AMF plays are short (~150-350 frames). Shorter sample window than SportsMOT's 60.
+SAMPLE_LENGTHS: [30, ]
+
+# Sample every 10th valid start position to keep steps/epoch manageable.
+# ~231k valid starts / 10 / 4 GPUs ≈ 5.8k steps/epoch → ~4.5h/epoch on g5.12xlarge.
+SAMPLE_STRIDE: 10
+
+# Initialise from AMF stage-1 DETR checkpoint (loaded via --detr-pretrain in entrypoint).
+DETR_PRETRAIN:
+
+MISS_TOLERANCE: 30
+
+# 3 epochs fits in 16h wall time (3 × ~4.5h + overhead).
+EPOCHS: 3
+SCHEDULER_MILESTONES: [2, ]
+
+MAX_TRACKS: 0

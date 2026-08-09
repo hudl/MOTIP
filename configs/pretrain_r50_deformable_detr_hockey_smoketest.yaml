@@ -1,0 +1,11 @@
+SUPER_CONFIG_PATH: ./configs/pretrain_r50_deformable_detr_sportsmot.yaml
+
+DATASETS: [Hockey]
+DATASET_SPLITS: [train]
+
+# Skip periodic during/after-training evaluation for this smoke test — we
+# have no Hockey val/test split wired into MOTIP's own inference path yet
+# (the 9 held-out corpus clips are being evaluated separately). This run is
+# purely to prove the data + pipeline mechanics: does it load, does the loss
+# go down, do checkpoints save.
+INFERENCE_DATASET:

@@ -1,0 +1,10 @@
+SUPER_CONFIG_PATH: ./configs/r50_deformable_detr_motip_sportsmot.yaml
+
+DATASETS: [Hockey]
+DATASET_SPLITS: [train]
+
+# Stage 2 (full MOTIP: detector + ID-association head), as opposed to the
+# stage-1 DETR-only pretrain we already smoke-tested. Skip during/after
+# training evaluation for the same reason as stage 1 — no Hockey val/test
+# split wired into MOTIP's own inference path yet.
+INFERENCE_DATASET:
