@@ -1,7 +1,7 @@
-# MOTIP AMF Training & Inference
+# MOTIP Training & Inference
 
-End-to-end guide for training MOTIP on AMF (American Football) data and running
-inference with the resulting checkpoint.
+End-to-end guide for training MOTIP on American Football (AMF/STAD) and Ice Hockey data,
+and running inference with the resulting checkpoints.
 
 ## Architecture overview
 
