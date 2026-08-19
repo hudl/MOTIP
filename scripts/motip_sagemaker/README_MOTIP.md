@@ -40,8 +40,9 @@ MOTIP trains in two stages:
 
 ### Prerequisites
 
-- SageMaker submission uses a special venv: `/tmp/sm_venv/bin/python3`
-- If it doesn't exist: `python3 -m venv /tmp/sm_venv && /tmp/sm_venv/bin/pip install sagemaker boto3`
+- Run all submission commands from **inside the devcontainer** (`root@<container_id>:/workspaces/sip-tracking-clean`).
+  The devcontainer's venv already has `sagemaker` and `boto3` installed — no separate venv needed.
+- AWS credentials must be active (run `aws sts get-caller-identity` to verify).
 
 ### Step 1: Prepare staging directory
 
@@ -56,10 +57,10 @@ pruning weights/videos/build artifacts.
 
 ```bash
 # Stage 1 (detection pretrain):
-/tmp/sm_venv/bin/python3 scripts/motip_sagemaker/submit_motip_sagemaker.py stage1-amf
+python scripts/motip_sagemaker/submit_motip_sagemaker.py stage1-amf
 
 # Stage 2 (full MOTIP tracking):
-/tmp/sm_venv/bin/python3 scripts/motip_sagemaker/submit_motip_sagemaker.py stage2-amf
+python scripts/motip_sagemaker/submit_motip_sagemaker.py stage2-amf
 ```
 
 ### Step 3: Monitor
@@ -256,7 +257,7 @@ Built by: `/tmp/_build_crossing_dataset.py` (on devbox)
 bash scripts/motip_sagemaker/prepare_motip_staging.sh
 
 # 2. Submit (4x A10G, ~2-3h expected)
-/tmp/sm_venv/bin/python3 scripts/motip_sagemaker/submit_motip_sagemaker.py crossing-finetune
+python scripts/motip_sagemaker/submit_motip_sagemaker.py crossing-finetune
 ```
 
 | Config | Base checkpoint | Epochs | LR | Instance |
@@ -417,7 +418,7 @@ Training on the new STAD tracking dataset v2 (`s3://hudl-experiments/touchdown/d
 | Stage-1 checkpoint | `.../checkpoint_19.pth` — **final epoch, use this** |
 | Stage-1 checkpoint path | `s3://hudl-experiments-v1/finlay/motip_amf_stage1_pretrain_v1/checkpoints/motip-hockey-stage1-amf-2026-08-16-10-09-44/checkpoint_19.pth` |
 | Stage-1 dataset | `s3://hudl-experiments-v1/finlay/amfb_detection/` |
-| Stage-2 dataset | `s3://hudl-experiments/touchdown/datasets/tracking_stad_v2/` (32 clips, MOT layout) |
+| Stage-2 dataset | `s3://hudl-experiments/touchdown/datasets/tracking_stad_v2/` (dataset still being populated, 1700+ clips as of 2026-08-19) |
 | Stage-2 config | `configs/r50_deformable_detr_motip_amf_stad.yaml` |
 | Stage-2 output | `s3://hudl-experiments-v1/finlay/motip_amf_stad_stage2_v1/checkpoints/` |
 | MLflow experiment | `motip-amf-stad-stage2` |
@@ -429,7 +430,7 @@ Training on the new STAD tracking dataset v2 (`s3://hudl-experiments/touchdown/d
 | 1 | `configs/pretrain_r50_deformable_detr_amf.yaml` | 20 | 1e-4, decay at ep15 | ml.g5.12xlarge |
 | 2 | `configs/r50_deformable_detr_motip_amf_stad.yaml` | 8 | 1e-4, decay at ep6 | ml.g5.12xlarge |
 
-Stage-2 uses `SAMPLE_STRIDE: 1` (vs 10 for AMF v1) because the dataset has only 32 clips.
+Stage-2 uses `SAMPLE_STRIDE: 10`, matching AMF v1 scale (~1700+ clips, dataset still being populated).
 
 ### How to run
 
@@ -438,7 +439,7 @@ Stage-2 uses `SAMPLE_STRIDE: 1` (vs 10 for AMF v1) because the dataset has only 
 bash scripts/motip_sagemaker/prepare_motip_staging.sh
 
 # 2. Submit
-/tmp/sm_venv/bin/python3 scripts/motip_sagemaker/submit_motip_sagemaker.py stage2-amf-stad
+python scripts/motip_sagemaker/submit_motip_sagemaker.py stage2-amf-stad
 ```
 
 ### Cross-bucket access note
