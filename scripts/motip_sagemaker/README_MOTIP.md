@@ -315,85 +315,6 @@ Output: `s3://hudl-experiments-v1/finlay/motip_crossing_finetune_v1/checkpoints/
 
 Base checkpoint stored at: `s3://hudl-experiments-v1/finlay/motip_amf_stage2_v1/checkpoints/crossing_finetune_base/stage2_g7e_checkpoint_12.pth`
 
-## Crossing fine-tune (hockey identity correction)
-
-Fine-tunes the stage-2 hockey checkpoint on crossing-focused sequences to
-improve re-ID through player crossings (high-IoU overlap events).
-
-### Dataset
-
-Built from golden_50 clips by extracting 80-frame stride-4 windows around each
-crossing event (IoU >= 0.45 between two tracks for >= 3 frames).
-
-| Split | Sequences | Source |
-|-------|-----------|--------|
-| train | 1551 | 41 clips from golden_50 |
-| val | 205 | 9 held-out clips (same val split as original hockey training) |
-
-Val clips (by prefix): 005254c3, 08d9c172, 0baebce3, 35a6df02, 39f231f4,
-4500df42, a673db5b, a9b71947, b4b96185.
-
-Dataset location: 
-(also on EFS at )
-
-Built by:  (copied to devbox )
-
-### Training
-
-
-
-| Config | Base checkpoint | Epochs | LR | Instance |
-|--------|----------------|--------|-----|----------|
-|  |  (epoch 12) | 13→21 (8 new) | 2e-5 | ml.g5.12xlarge (4xA10G) |
-
-Key settings:
--  /  — fresh optimizer, avoids inheriting stale momentum
--  — colour jitter disabled (torchvision API incompatibility in SageMaker image)
--  /  — matches training domain (stride-4 sequences)
--  — saves every epoch
-
-### Checkpoints
-
-Output: 
-
-Base checkpoint stored at: 
-
-### Per-crossing evaluation
-
-Evaluates MOTIP's ability to correct OFSort identity swaps at crossing events.
-For each crossing in golden_50, extracts an 80-frame stride-4 window, runs MOTIP
-from scratch, and compares its identity assignment against GT.
-
-**Script**: 
-
-**How to run**:
-
-
-**Important**: The  export is mandatory. Without it, torch in
- cannot find  and falls back to CPU (10x slower).
-
-**Metrics**:
-- TP: MOTIP correctly detects a swap that OFSort made
-- FP: MOTIP says swap but OFSort was correct
-- TN: Both agree no swap happened
-- FN: Swap exists but MOTIP missed it
-- Net = TP - FP (must be >0 for MOTIP to add value)
-- Precision = TP / (TP + FP)
-
-**OFSort baseline**: Gets 150/237 events right (63%), swaps 87/237 (37%).
-
-**Results (2026-08-01)**:
-| Checkpoint | Epochs fine-tuned | Precision | Net |
-|---|---|---|---|
-| 12 (baseline) | 0 | 36.6% | -22 |
-| 13 | +1 | 38.8% | -18 |
-| 14 | +2 | 38.3% | -19 |
-| 16 | +4 | 36.4% | -21 |
-
-Conclusion: Fine-tuning gives marginal improvement at epoch 1 then regresses.
-MOTIP precision stays ~37% — below the 50% threshold needed for net-positive
-correction.
-
 ### Per-crossing evaluation
 
 Evaluates MOTIP's ability to correct OFSort identity swaps at crossing events.
@@ -467,7 +388,7 @@ Training on the new STAD tracking dataset v2 (`s3://hudl-experiments/touchdown/d
 | Stage | Config | Epochs | LR schedule | Instance |
 |-------|--------|--------|-------------|----------|
 | 1 | `configs/pretrain_r50_deformable_detr_amf.yaml` | 20 | 1e-4, decay at ep15 | ml.g5.12xlarge |
-| 2 | `configs/r50_deformable_detr_motip_amf_stad.yaml` | 8 | 1e-4, decay at ep6 | ml.g5.12xlarge |
+| 2 | `configs/r50_deformable_detr_motip_amf_stad.yaml` | 14 | 1e-4, decay at ep10 | ml.g5.12xlarge |
 
 Stage-2 uses `SAMPLE_STRIDE: 10`, matching AMF v1 scale (~1700+ clips, dataset still being populated).
 
