@@ -20,12 +20,33 @@ MOTIP trains in two stages:
 
 ## Data locations (S3)
 
+### American football
+
 | Asset | S3 path |
 |-------|---------|
 | Stage-1 training data (detection) | `s3://hudl-experiments-v1/finlay/amfb_detection/` |
-| Stage-2 training data (tracking sequences) | `s3://hudl-experiments-v1/finlay/amfb_motip_stage2/motip_hockey_data/` |
+| Stage-2 training data (AMF tracking) | `s3://hudl-experiments-v1/finlay/amfb_motip_stage2/motip_hockey_data/` |
+| Stage-2 training data (STAD v2 tracking) | `s3://hudl-experiments/touchdown/datasets/tracking_stad_v2/` |
 | Stage-1 checkpoints | `s3://hudl-experiments-v1/finlay/motip_amf_stage1_pretrain_v1/checkpoints/` |
-| Stage-2 checkpoints | `s3://hudl-experiments-v1/finlay/motip_amf_stage2_v1/checkpoints/` |
+| Stage-2 checkpoints (AMF) | `s3://hudl-experiments-v1/finlay/motip_amf_stage2_v1/checkpoints/` |
+| Stage-2 checkpoints (STAD) | `s3://hudl-experiments-v1/finlay/motip_amf_stad_stage2_v1/checkpoints/` |
+
+### Ice hockey
+
+| Asset | S3 path |
+|-------|---------|
+| Stage-1/2 training data | `s3://hudl-experiments-v1/faceoff/metaflow/data/tracking_workgroup/tracking_experiments/` |
+| Crossing fine-tune data | `s3://hudl-experiments-v1/faceoff/metaflow/data/tracking_workgroup/tracking_experiments/motip_crossing_dataset/` |
+| Crossing fine-tune data (stride-1) | `s3://hudl-experiments-v1/faceoff/metaflow/data/tracking_workgroup/tracking_experiments/motip_crossing_dataset_s1/` |
+| Stage-1 checkpoints | `s3://hudl-experiments-v1/finlay/motip_hockey_stage1_pretrain_v1/checkpoints/` |
+| Stage-2 checkpoints | `s3://hudl-experiments-v1/finlay/motip_hockey_stage2_real_v1/checkpoints/` |
+| Crossing fine-tune checkpoints | `s3://hudl-experiments-v1/finlay/motip_crossing_finetune_v2/checkpoints/` |
+| Crossing fine-tune checkpoints (stride-1) | `s3://hudl-experiments-v1/finlay/motip_crossing_finetune_s1/checkpoints/` |
+
+### Shared
+
+| Asset | S3 path |
+|-------|---------|
 | COCO/SportsMOT pretrained DETR (stage-1 init) | `s3://hudl-experiments-v1/finlay/motip_hockey_smoketest/pretrain/r50_deformable_detr_coco_sportsmot.pth` |
 
 ### Key checkpoints
