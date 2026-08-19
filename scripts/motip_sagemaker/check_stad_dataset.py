@@ -79,15 +79,15 @@ def check_gt(s3, bucket, prefix, clip, seq_len=None):
         return f"gt/gt.txt error: {e}"
 
 
-def check_images(s3, bucket, prefix, clip):
+def check_images(s3, bucket, prefix, clip, seq_len=None):
     paginator = s3.get_paginator("list_objects_v2")
     count = 0
-    for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}{clip}/img1/", MaxKeys=5):
-        count += len(page.get("Contents", []))
-        if count > 0:
-            break
+    for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}{clip}/img1/"):
+        count += sum(1 for o in page.get("Contents", []) if o["Key"].endswith(".jpg"))
     if count == 0:
         return "img1/ has no images"
+    if seq_len is not None and count != seq_len:
+        return f"img1/ has {count} images but seqlength={seq_len}"
     return None
 
 
@@ -144,7 +144,7 @@ def main():
         gt_issue = check_gt(s3, BUCKET, args.prefix, clip, seq_len=seq_len)
         if gt_issue:
             issues.append(gt_issue)
-        img_issue = check_images(s3, BUCKET, args.prefix, clip)
+        img_issue = check_images(s3, BUCKET, args.prefix, clip, seq_len=seq_len)
         if img_issue:
             issues.append(img_issue)
 

@@ -24,22 +24,42 @@ class STADTracking(DanceTrack):
         )
 
     def _get_sequence_names(self):
-        # Only return sequences that have a valid seqinfo.ini with a [Sequence]
-        # section — some STAD clips were uploaded without one and would crash
-        # configparser with KeyError: 'Sequence' during _get_sequence_infos().
+        # Filter out sequences with any of:
+        #   - missing/invalid seqinfo.ini (no [Sequence] section)
+        #   - image count != seqlength (frame gaps cause FileNotFoundError in DataLoader)
         split_dir = os.path.join(self.data_dir, self.split)
         valid = []
-        skipped = 0
+        skip_ini = 0
+        skip_frames = 0
         for name in os.listdir(split_dir):
-            ini_path = os.path.join(split_dir, name, "seqinfo.ini")
+            seq_dir = os.path.join(split_dir, name)
+            if not os.path.isdir(seq_dir):
+                continue
+            ini_path = os.path.join(seq_dir, "seqinfo.ini")
             ini = ConfigParser()
             ini.read(ini_path)
-            if "Sequence" in ini:
-                valid.append(name)
-            else:
-                skipped += 1
-        if skipped:
-            print(f"[STADTracking] WARNING: skipped {skipped} sequences with missing/invalid seqinfo.ini")
+            if "Sequence" not in ini:
+                skip_ini += 1
+                continue
+            try:
+                seq_len = int(ini["Sequence"]["seqlength"])
+            except (KeyError, ValueError):
+                skip_ini += 1
+                continue
+            img_dir = os.path.join(seq_dir, "img1")
+            try:
+                n_images = len([f for f in os.listdir(img_dir) if f.endswith(".jpg")])
+            except FileNotFoundError:
+                skip_frames += 1
+                continue
+            if n_images != seq_len:
+                skip_frames += 1
+                continue
+            valid.append(name)
+        if skip_ini:
+            print(f"[STADTracking] WARNING: skipped {skip_ini} sequences with missing/invalid seqinfo.ini")
+        if skip_frames:
+            print(f"[STADTracking] WARNING: skipped {skip_frames} sequences with frame count != seqlength")
         return valid
 
     def _get_annotations(self):
