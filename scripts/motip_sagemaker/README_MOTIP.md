@@ -53,14 +53,32 @@ bash scripts/motip_sagemaker/prepare_motip_staging.sh
 This copies `third_party/MOTIP/` to `/tmp/motip_sm_staging/` with entrypoints,
 pruning weights/videos/build artifacts.
 
+### Available stages
+
+| Stage key | Sport | Description |
+|-----------|-------|-------------|
+| `stage1-real` | Ice hockey | Stage 1 — DETR detector pretrain on real hockey tracking data |
+| `stage2-real` | Ice hockey | Stage 2 — full MOTIP on real hockey tracking data |
+| `crossing-finetune` | Ice hockey | Fine-tune stage-2 checkpoint with crossing-specific config |
+| `crossing-finetune-s1` | Ice hockey | Crossing fine-tune from a specific stage-2 checkpoint (stride-1) |
+| `stage1-amf` | American football | Stage 1 — DETR detector pretrain on AMF detection dataset |
+| `stage2-amf` | American football | Stage 2 — full MOTIP on AMF tracking data |
+| `stage2-amf-stad` | American football | Stage 2 — full MOTIP on STAD v2 tracking data (reuses AMF stage-1 checkpoint) |
+
 ### Step 2: Submit job
 
 ```bash
-# Stage 1 (detection pretrain):
+# American football — stage 1 (detection pretrain):
 python scripts/motip_sagemaker/submit_motip_sagemaker.py stage1-amf
 
-# Stage 2 (full MOTIP tracking):
+# American football — stage 2 (full MOTIP tracking):
 python scripts/motip_sagemaker/submit_motip_sagemaker.py stage2-amf
+
+# Ice hockey — stage 1:
+python scripts/motip_sagemaker/submit_motip_sagemaker.py stage1-real
+
+# Ice hockey — stage 2:
+python scripts/motip_sagemaker/submit_motip_sagemaker.py stage2-real
 ```
 
 ### Step 3: Monitor
