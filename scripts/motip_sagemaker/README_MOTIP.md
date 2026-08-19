@@ -402,3 +402,48 @@ sed -i 's|stage2_g7e_checkpoint_12.pth|../motip_crossing_finetune_v1/checkpoint_
 Conclusion: Fine-tuning gives marginal improvement at epoch 1 then regresses.
 MOTIP precision stays ~37% -- below the 50% threshold needed for net-positive
 correction.
+
+---
+
+## MOTIP AMF STAD Stage 2
+
+Training on the new STAD tracking dataset v2 (`s3://hudl-experiments/touchdown/datasets/tracking_stad_v2`).
+
+### Stage 1 → Stage 2 lineage
+
+| Item | Value |
+|------|-------|
+| Stage-1 run | `motip-hockey-stage1-amf-2026-08-16-10-09-44` (full 20 epochs) |
+| Stage-1 checkpoint | `.../checkpoint_19.pth` — **final epoch, use this** |
+| Stage-1 checkpoint path | `s3://hudl-experiments-v1/finlay/motip_amf_stage1_pretrain_v1/checkpoints/motip-hockey-stage1-amf-2026-08-16-10-09-44/checkpoint_19.pth` |
+| Stage-1 dataset | `s3://hudl-experiments-v1/finlay/amfb_detection/` |
+| Stage-2 dataset | `s3://hudl-experiments/touchdown/datasets/tracking_stad_v2/` (32 clips, MOT layout) |
+| Stage-2 config | `configs/r50_deformable_detr_motip_amf_stad.yaml` |
+| Stage-2 output | `s3://hudl-experiments-v1/finlay/motip_amf_stad_stage2_v1/checkpoints/` |
+| MLflow experiment | `motip-amf-stad-stage2` |
+
+### Training configs
+
+| Stage | Config | Epochs | LR schedule | Instance |
+|-------|--------|--------|-------------|----------|
+| 1 | `configs/pretrain_r50_deformable_detr_amf.yaml` | 20 | 1e-4, decay at ep15 | ml.g5.12xlarge |
+| 2 | `configs/r50_deformable_detr_motip_amf_stad.yaml` | 8 | 1e-4, decay at ep6 | ml.g5.12xlarge |
+
+Stage-2 uses `SAMPLE_STRIDE: 1` (vs 10 for AMF v1) because the dataset has only 32 clips.
+
+### How to run
+
+```bash
+# 1. Prepare staging
+bash scripts/motip_sagemaker/prepare_motip_staging.sh
+
+# 2. Submit
+/tmp/sm_venv/bin/python3 scripts/motip_sagemaker/submit_motip_sagemaker.py stage2-amf-stad
+```
+
+### Cross-bucket access note
+
+The STAD dataset is in `s3://hudl-experiments` (not the usual `hudl-experiments-v1`).
+If the SageMaker job fails to pull training data, confirm that the execution role
+`arn:aws:iam::690616407375:role/p-sagemaker-execution-role` has `s3:GetObject`
+permission on `arn:aws:s3:::hudl-experiments/*`.

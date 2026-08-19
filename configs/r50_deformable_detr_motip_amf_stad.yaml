@@ -1,0 +1,24 @@
+SUPER_CONFIG_PATH: ./configs/r50_deformable_detr_motip_sportsmot.yaml
+
+DATASETS: [STADTracking]
+DATASET_SPLITS: [train]
+
+# No val split wired yet.
+INFERENCE_DATASET:
+
+# STAD plays are football clips; same 30-frame sample window as AMF.
+SAMPLE_LENGTHS: [30, ]
+
+# Dataset is small (~32 clips vs ~1050 AMF plays). Use all valid start positions.
+SAMPLE_STRIDE: 1
+
+# Initialised from AMF stage-1 DETR checkpoint via --detr-pretrain in the entrypoint.
+DETR_PRETRAIN:
+
+MISS_TOLERANCE: 30
+
+# 8 epochs matches the effective AMF v1 run (5 initial + 3 resume = 8 total).
+EPOCHS: 8
+SCHEDULER_MILESTONES: [6, ]
+
+MAX_TRACKS: 0

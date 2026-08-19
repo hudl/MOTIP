@@ -15,6 +15,7 @@ from .bft import BFT
 from .hockey import Hockey
 from .amf_detection import AMFDetection
 from .amf_tracking import AMFTracking
+from .stad_tracking import STADTracking
 
 
 dataset_classes = {
@@ -25,6 +26,7 @@ dataset_classes = {
     "Hockey": Hockey,
     "AMFDetection": AMFDetection,
     "AMFTracking": AMFTracking,
+    "STADTracking": STADTracking,
 }
 
 

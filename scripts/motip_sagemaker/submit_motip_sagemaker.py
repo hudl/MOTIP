@@ -39,22 +39,26 @@ ENTRYPOINTS = {
     "stage2-real": "motip_sm_entrypoint_stage2_real.sh",
     "mgpu-smoke": "motip_sm_entrypoint_mgpu_smoke.sh",
     "stage1-amf": "motip_sm_entrypoint_stage1_amf.sh",
+    "stage1-amf-resume": "motip_sm_entrypoint_stage1_amf_resume.sh",
     "stage2-amf": "motip_sm_entrypoint_stage2_amf.sh",
     "stage2-amf-resume": "motip_sm_entrypoint_stage2_amf_resume.sh",
     "stage2-amf-resume2": "motip_sm_entrypoint_stage2_amf_resume2.sh",
     "crossing-finetune": "motip_sm_entrypoint_crossing_finetune.sh",
     "crossing-finetune-s1": "motip_sm_entrypoint_crossing_finetune_s1.sh",
     "crossing-finetune-s1-resume": "motip_sm_entrypoint_crossing_finetune_s1_resume.sh",
+    "stage2-amf-stad": "motip_sm_entrypoint_stage2_amf_stad.sh",
 }
 ENTRYPOINT = ENTRYPOINTS[STAGE]
 IS_REAL = STAGE.endswith("-real")
 IS_STAGE2_REAL = STAGE == "stage2-real"
 IS_MGPU_SMOKE = STAGE == "mgpu-smoke"
 IS_AMF_STAGE1 = STAGE == "stage1-amf"
+IS_AMF_STAGE1_RESUME = STAGE == "stage1-amf-resume"
 IS_AMF_STAGE2 = STAGE == "stage2-amf"
 IS_AMF_STAGE2_RESUME = STAGE == "stage2-amf-resume"
 IS_AMF_STAGE2_RESUME2 = STAGE == "stage2-amf-resume2"
-IS_AMF = IS_AMF_STAGE1 or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2
+IS_AMF_STAD_STAGE2 = STAGE == "stage2-amf-stad"
+IS_AMF = IS_AMF_STAGE1 or IS_AMF_STAGE1_RESUME or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2 or IS_AMF_STAD_STAGE2
 IS_CROSSING_FINETUNE = STAGE == "crossing-finetune"
 IS_CROSSING_FINETUNE_S1 = STAGE == "crossing-finetune-s1"
 IS_CROSSING_FINETUNE_S1_RESUME = STAGE == "crossing-finetune-s1-resume"
@@ -85,7 +89,13 @@ elif IS_AMF_STAGE1:
     OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_amf_stage1_pretrain_v1"
     INSTANCE_TYPE = "ml.g5.12xlarge"
     NUM_INSTANCES = 1
-    MAX_RUNTIME = 12 * 3600  # 20 epochs on 4x A10G, ~10h expected
+    MAX_RUNTIME = 30 * 3600  # 20 epochs on 4x A10G, ~24h with buffer
+elif IS_AMF_STAGE1_RESUME:
+    DATA_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/amfb_detection"
+    OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_amf_stage1_pretrain_v1"
+    INSTANCE_TYPE = "ml.g5.12xlarge"
+    NUM_INSTANCES = 1
+    MAX_RUNTIME = 14 * 3600  # epochs 10-19 (~11 more at ~4300s/epoch)
 elif IS_AMF_STAGE2:
     DATA_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/amfb_motip_stage2"
     OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_amf_stage2_v1"
@@ -104,6 +114,13 @@ elif IS_AMF_STAGE2_RESUME2:
     INSTANCE_TYPE = "ml.g5.12xlarge"
     NUM_INSTANCES = 1
     MAX_RUNTIME = 16 * 3600  # epochs 6-8 (3 more epochs from checkpoint_5)
+elif IS_AMF_STAD_STAGE2:
+    # Dataset is in a different bucket from the usual hudl-experiments-v1.
+    DATA_BUCKET_PREFIX = "s3://hudl-experiments/touchdown/datasets/tracking_stad_v2"
+    OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_amf_stad_stage2_v1"
+    INSTANCE_TYPE = "ml.g5.12xlarge"
+    NUM_INSTANCES = 1
+    MAX_RUNTIME = 48 * 3600  # 8 epochs on 32-clip dataset; steps/epoch unknown, generous budget
 elif IS_MGPU_SMOKE:
     # Small 20-sequence dataset already in S3 (no download wait), but the
     # real multi-GPU instance — isolate GPU/EFA/distributed issues fast
@@ -155,7 +172,7 @@ compute_config = Compute(
     instance_type=INSTANCE_TYPE,
     instance_count=NUM_INSTANCES,
     keep_alive_period_in_seconds=0,
-    volume_size_in_gb=100 if (IS_REAL or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2) else 50,
+    volume_size_in_gb=100 if (IS_REAL or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2 or IS_AMF_STAD_STAGE2) else 50,
 )
 output_data_config = OutputDataConfig(s3_output_path=f"{OUTPUT_BUCKET_PREFIX}/output")
 checkpoint_config = CheckpointConfig(
@@ -188,8 +205,9 @@ model_trainer = ModelTrainer(
     environment={
         "MLFLOW_TRACKING_URI": "https://aml-mlflow.hudltools.com",
         "MLFLOW_EXPERIMENT_NAME": (
-            "motip-amf-stage1" if IS_AMF_STAGE1
+            "motip-amf-stage1" if (IS_AMF_STAGE1 or IS_AMF_STAGE1_RESUME)
             else "motip-amf-stage2" if (IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2)
+            else "motip-amf-stad-stage2" if IS_AMF_STAD_STAGE2
             else f"motip-hockey-{STAGE}"
         ),
         "MLFLOW_WORKSPACE": "faceoff",
@@ -221,12 +239,19 @@ PRETRAIN_PREFIX = (
     else "s3://hudl-experiments-v1/finlay/motip_amf_stage2_v1/checkpoints/"
     "motip-hockey-stage2-amf-2026-07-24-15-18-34"
     if IS_AMF_STAGE2_RESUME
+    else "s3://hudl-experiments-v1/finlay/motip_amf_stage1_pretrain_v1/checkpoints/"
+    "motip-hockey-stage1-amf-2026-08-14-22-21-06"
+    if IS_AMF_STAGE1_RESUME
+    else "s3://hudl-experiments-v1/finlay/motip_amf_stage1_pretrain_v1/checkpoints/"
+    "motip-hockey-stage1-amf-2026-08-16-10-09-44"
+    if IS_AMF_STAD_STAGE2
     else "s3://hudl-experiments-v1/finlay/motip_hockey_smoketest/pretrain"
 )
 TRAIN_DATA_SOURCE = (
     DATA_BUCKET_PREFIX if (IS_CROSSING_FINETUNE or IS_CROSSING_FINETUNE_S1 or IS_CROSSING_FINETUNE_S1_RESUME)
     else
-    DATA_BUCKET_PREFIX if IS_AMF_STAGE1  # amfb_detection/train/images/ is at root
+    DATA_BUCKET_PREFIX if (IS_AMF_STAGE1 or IS_AMF_STAGE1_RESUME)  # amfb_detection/train/images/ is at root
+    else DATA_BUCKET_PREFIX if IS_AMF_STAD_STAGE2  # STADTracking: train/ at bucket root, no sub_dir wrapper
     else f"{DATA_BUCKET_PREFIX}/motip_hockey_data" if IS_REAL
     else f"{DATA_BUCKET_PREFIX}/data/motip_hockey_data" if not (IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2)
     else f"{DATA_BUCKET_PREFIX}/motip_hockey_data"  # mounts AMFTracking/train/ at channel root

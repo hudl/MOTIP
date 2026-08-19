@@ -299,8 +299,8 @@ class MultiColorJitter:
             images = self.color_jitter(images)
         elif isinstance(images, list):
             assert isinstance(images[0], Image.Image)
-            params = self.color_jitter._get_params([images[0]])
-            images = [self.color_jitter._transform(_, params=params) for _ in images]
+            params = self.color_jitter.make_params([images[0]])
+            images = [self.color_jitter.transform(_, params=params) for _ in images]
         else:
             raise NotImplementedError(f"The input image type {type(images)} is not supported.")
         return images, annotations, metas
@@ -311,8 +311,8 @@ class MultiRandomPhotometricDistort:
         self.ramdom_photometric_distort = v2.RandomPhotometricDistort()
 
     def __call__(self, images, annotations, metas):
-        _params = self.ramdom_photometric_distort._get_params([images[0]])
-        images = [self.ramdom_photometric_distort._transform(_, _params) for _ in images]
+        _params = self.ramdom_photometric_distort.make_params([images[0]])
+        images = [self.ramdom_photometric_distort.transform(_, _params) for _ in images]
         return images, annotations, metas
 
 

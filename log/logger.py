@@ -4,8 +4,6 @@ import os
 import json
 import argparse
 import yaml
-import wandb
-
 from tqdm import tqdm
 from typing import Any
 
@@ -62,6 +60,7 @@ class Logger:
         if is_main_process():
             os.makedirs(self.logdir, exist_ok=True)
             if use_wandb:       # init wandb
+                import wandb
                 assert config is not None, "Please set the config for the experiment."
                 assert exp_owner is not None, "Please set the owner of the experiment."
                 assert exp_project is not None, "Please set the project of the experiment."
@@ -273,6 +272,7 @@ class Logger:
 
     def wandb_log(self, data: dict, step: int):
         if self.wandb:
+            import wandb
             wandb.log(data=data, step=step)
         return
 

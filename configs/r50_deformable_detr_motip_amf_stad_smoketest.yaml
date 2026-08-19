@@ -1,0 +1,15 @@
+SUPER_CONFIG_PATH: ./configs/r50_deformable_detr_motip_amf_stad.yaml
+
+# Smoke test overrides: 1 epoch, large stride to keep steps minimal
+EPOCHS: 1
+SCHEDULER_MILESTONES: []
+SAMPLE_STRIDE: 50
+
+# Disable wandb for local runs
+USE_WANDB: False
+
+# Disable colour jitter — torchvision _get_params API incompatibility in this env
+AUG_BRIGHTNESS: 0.0
+AUG_CONTRAST: 0.0
+AUG_SATURATION: 0.0
+AUG_HUE: 0.0

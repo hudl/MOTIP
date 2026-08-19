@@ -104,8 +104,9 @@ def train_engine(config: dict):
             model=model, pretrain_path=config["DETR_PRETRAIN"], num_classes=config["NUM_CLASSES"],
             default_class_idx=config["DETR_DEFAULT_CLASS_IDX"] if "DETR_DEFAULT_CLASS_IDX" in config else None,
         )
+        detr_path = config["DETR_PRETRAIN"]
         logger.success(
-            log=f"Load the pre-trained DETR from '{config["DETR_PRETRAIN"]}'. "
+            log=f"Load the pre-trained DETR from '{detr_path}'. "
         )
     # Build Loss Function:
     id_criterion = build_id_criterion(config=config)
