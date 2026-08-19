@@ -432,6 +432,19 @@ Training on the new STAD tracking dataset v2 (`s3://hudl-experiments/touchdown/d
 
 Stage-2 uses `SAMPLE_STRIDE: 10`, matching AMF v1 scale (~1700+ clips, dataset still being populated).
 
+### Smoketest (local, before full run)
+
+Run from inside the devcontainer to verify data access, the dataset class, and one training epoch
+before committing to a multi-hour SageMaker job:
+
+```bash
+bash scripts/motip_sagemaker/run_motip_stad_local_smoketest.sh
+```
+
+This downloads 3 STAD clips + `checkpoint_19.pth`, then runs 1 epoch on 1 GPU with
+`SAMPLE_STRIDE: 50` (config: `r50_deformable_detr_motip_amf_stad_smoketest.yaml`).
+Completes in ~5 minutes. Output checkpoint lands in `/tmp/motip_stad_smoketest_out/`.
+
 ### How to run
 
 ```bash
