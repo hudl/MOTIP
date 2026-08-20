@@ -7,6 +7,9 @@ from configparser import ConfigParser
 
 from .dancetrack import DanceTrack
 
+# Minimum frames needed to form one valid sample (sample_length=30 at interval=1).
+_MIN_SAMPLE_FRAMES = 30
+
 
 class STADTracking(DanceTrack):
     def __init__(
@@ -15,13 +18,31 @@ class STADTracking(DanceTrack):
             sub_dir: str = "",
             split: str = "train",
             load_annotation: bool = True,
+            start_frame_fraction: float = 1.0,
     ):
+        # Fraction of each clip's frames that are eligible as start positions.
+        # 1.0 = full clip; 0.2 = first 20%; 0.0 = frame 0 only.
+        self.start_frame_fraction = start_frame_fraction
         super(STADTracking, self).__init__(
             data_root=data_root,
             sub_dir=sub_dir,
             split=split,
             load_annotation=load_annotation,
         )
+
+    def get_sequence_infos(self):
+        if self.start_frame_fraction >= 1.0:
+            return self.sequence_infos
+        # Cap the reported length so the sampler only picks starts from the
+        # first (start_frame_fraction * real_length) frames.  Internal uses
+        # (annotation loading, image paths) still see the real length via
+        # self.sequence_infos, so nothing else breaks.
+        limited = {}
+        for seq, meta in self.sequence_infos.items():
+            real_len = meta["length"]
+            capped = max(_MIN_SAMPLE_FRAMES, int(real_len * self.start_frame_fraction))
+            limited[seq] = {**meta, "length": capped}
+        return limited
 
     def _get_sequence_names(self):
         # Filter out sequences with any of:

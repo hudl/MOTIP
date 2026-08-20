@@ -10,7 +10,8 @@ INFERENCE_DATASET:
 SAMPLE_LENGTHS: [30, ]
 
 # ~1700+ clips (dataset still being populated); stride 10 matches AMF v1 scale.
-SAMPLE_STRIDE: 9999
+SAMPLE_STRIDE: 10
+START_FRAME_FRACTION: 0.2  # only start from first 20% of each clip
 
 # Initialised from AMF stage-1 DETR checkpoint via --detr-pretrain in the entrypoint.
 DETR_PRETRAIN:

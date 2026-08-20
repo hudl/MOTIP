@@ -51,6 +51,7 @@ class JointDataset(Dataset):
 
         # Handle the parameters **kwargs:
         self.size_divisibility = kwargs.get("size_divisibility", 0)
+        self.dataset_kwargs = kwargs.get("dataset_kwargs", {})
 
         # Load the datasets into "sequence_infos", "image_paths", and "annotations",
         # each of which is a dictionary with the dataset name and split as the key.
@@ -60,10 +61,12 @@ class JointDataset(Dataset):
         self.annotations = defaultdict(lambda: defaultdict(dict))
         for dataset, split in zip(datasets, splits):
             try:
+                extra_kwargs = self.dataset_kwargs.get(dataset, {})
                 dataset_class = dataset_classes[dataset](
                     data_root=data_root,
                     split=split,
                     load_annotation=True,
+                    **extra_kwargs,
                 )
                 self.sequence_infos[dataset][split] = dataset_class.get_sequence_infos()
                 self.image_paths[dataset][split] = dataset_class.get_image_paths()
