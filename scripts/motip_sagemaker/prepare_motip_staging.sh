@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MOTIP_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")/third_party/MOTIP"
+MOTIP_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 STAGE="/tmp/motip_sm_staging"
 
 echo "Staging from: ${MOTIP_ROOT}"

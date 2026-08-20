@@ -68,7 +68,8 @@ def run_sequence(model, cfg, seq_dir: str, seq_name: str) -> dict:
     for i in range(1, seq_info["seq_length"] + 1):
         image_paths.append(os.path.join(seq_info["img_dir"], f"{i:08d}{seq_info['ext']}"))
 
-    dtype = torch.float32
+    dtype_str = cfg.get("INFERENCE_DTYPE", "FP32")
+    dtype = torch.float16 if dtype_str == "FP16" else torch.float32
 
     sequence_dataset = SeqDataset(
         seq_info=seq_info,
