@@ -1,0 +1,2 @@
+SUPER_CONFIG_PATH: ./configs/pretrain_r50_deformable_detr_amf.yaml
+DETR_PRETRAIN: null
