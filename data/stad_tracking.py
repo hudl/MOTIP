@@ -40,7 +40,7 @@ class STADTracking(DanceTrack):
         limited = {}
         for seq, meta in self.sequence_infos.items():
             real_len = meta["length"]
-            capped = max(_MIN_SAMPLE_FRAMES, int(real_len * self.start_frame_fraction))
+            capped = min(real_len, max(_MIN_SAMPLE_FRAMES, int(real_len * self.start_frame_fraction)))
             limited[seq] = {**meta, "length": capped}
         return limited
 
