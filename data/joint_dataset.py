@@ -131,6 +131,12 @@ class JointDataset(Dataset):
                                     self.sample_begins.append((dataset, split, sequence_name, frame_id))
         return
 
+
+    def set_aug_trajectory_switch_prob(self, prob: float):
+        for t in self.transforms.transforms:
+            if hasattr(t, 'aug_trajectory_switch_prob'):
+                t.aug_trajectory_switch_prob = prob
+
     def __len__(self):
         assert self.sample_begins is not None, "Please use 'self.set_sample_details()' at the start of each epoch."
         return len(self.sample_begins)

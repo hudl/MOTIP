@@ -163,6 +163,23 @@ def train_engine(config: dict):
         logger.info(log=f"Start training epoch {epoch}.")
         epoch_start_timestamp = TPS.timestamp()
         # Prepare the sampler for the current epoch:
+        # Update AUG_TRAJECTORY_SWITCH_PROB if a schedule is configured:
+        switch_prob_schedule = config.get('AUG_TRAJECTORY_SWITCH_PROB_SCHEDULE', None)
+        if switch_prob_schedule is not None:
+            schedule = sorted(switch_prob_schedule, key=lambda x: x[0])
+            if epoch <= schedule[0][0]:
+                switch_prob = schedule[0][1]
+            elif epoch >= schedule[-1][0]:
+                switch_prob = schedule[-1][1]
+            else:
+                for i in range(len(schedule) - 1):
+                    e0, p0 = schedule[i]
+                    e1, p1 = schedule[i + 1]
+                    if e0 <= epoch < e1:
+                        switch_prob = p0 + (p1 - p0) * (epoch - e0) / (e1 - e0)
+                        break
+            train_dataset.set_aug_trajectory_switch_prob(switch_prob)
+            logger.info(fAUG_TRAJECTORY_SWITCH_PROB set to {switch_prob:.4f} for epoch {epoch}.)
         train_sampler.prepare_for_epoch(epoch=epoch)
         # Train one epoch:
         train_metrics = train_one_epoch(

@@ -21,5 +21,7 @@ MISS_TOLERANCE: 30
 # 8 epochs matches the effective AMF v1 run (5 initial + 3 resume = 8 total).
 EPOCHS: 14
 SCHEDULER_MILESTONES: [10, ]
+SCHEDULER_GAMMA: 0.3  # less aggressive decay: 1e-4 -> 3e-5 (base config has 0.1)
+AUG_TRAJECTORY_SWITCH_PROB_SCHEDULE: [[0, 0.5], [10, 0.0]]  # linear decay matching LR milestone
 
 MAX_TRACKS: 0
