@@ -1,0 +1,34 @@
+SUPER_CONFIG_PATH: ./configs/r50_deformable_detr_motip_sportsmot.yaml
+
+DATASETS: [STADTracking]
+DATASET_SPLITS: [train]
+
+INFERENCE_DATASET:
+
+# Longer sequences, denser sampling, starting later in clips.
+# Goal: expose model to full-speed crossing / route-running phase.
+SAMPLE_LENGTHS: [60]
+SAMPLE_INTERVALS: [2]
+SAMPLE_STRIDE: 10
+START_FRAME_FRACTION: 0.5  # allow starts in first half of play, not just first 20%
+
+# Resume from stage-2 checkpoint (not stage-3) — clean base before any scrum specialization.
+DETR_PRETRAIN:
+RESUME_MODEL:
+RESUME_OPTIMIZER: False
+RESUME_SCHEDULER: False
+RESUME_STATES: False
+
+MISS_TOLERANCE: 30
+
+EPOCHS: 3
+LR: 1.0e-5
+LR_BACKBONE_SCALE: 0.05
+SCHEDULER_MILESTONES: []
+SAVE_CHECKPOINT_PER_EPOCH: 1
+
+# Small switch prob — enough to train through crossings, not enough to destroy ID holding.
+AUG_TRAJECTORY_SWITCH_PROB: 0.1
+AUG_TRAJECTORY_OCCLUSION_PROB: 0.0
+
+MAX_TRACKS: 0
