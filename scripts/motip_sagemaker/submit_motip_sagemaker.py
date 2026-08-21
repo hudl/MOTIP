@@ -30,7 +30,7 @@ from sagemaker.modules.configs import (
 )
 from sagemaker.modules.train import ModelTrainer
 
-STAGE = sys.argv[1] if len(sys.argv) > 1 else "stage1"  # "stage1" | "stage2" | "stage1-real" | "stage2-real" | "mgpu-smoke" | "stage1-amf" | "stage2-amf" | "stage2-amf-resume"
+STAGE = sys.argv[1] if len(sys.argv) > 1 else "stage1"  # "stage1" | "stage2" | "stage1-real" | "stage2-real" | "mgpu-smoke" | "stage1-amf" | "stage2-amf" | "stage2-amf-resume" | "stage3-amf-stad"
 
 ENTRYPOINTS = {
     "stage1": "motip_sm_entrypoint.sh",
@@ -47,6 +47,7 @@ ENTRYPOINTS = {
     "crossing-finetune-s1": "motip_sm_entrypoint_crossing_finetune_s1.sh",
     "crossing-finetune-s1-resume": "motip_sm_entrypoint_crossing_finetune_s1_resume.sh",
     "stage2-amf-stad": "motip_sm_entrypoint_stage2_amf_stad.sh",
+    "stage3-amf-stad": "motip_sm_entrypoint_stage3_amf_stad.sh",
 }
 ENTRYPOINT = ENTRYPOINTS[STAGE]
 IS_REAL = STAGE.endswith("-real")
@@ -58,7 +59,8 @@ IS_AMF_STAGE2 = STAGE == "stage2-amf"
 IS_AMF_STAGE2_RESUME = STAGE == "stage2-amf-resume"
 IS_AMF_STAGE2_RESUME2 = STAGE == "stage2-amf-resume2"
 IS_AMF_STAD_STAGE2 = STAGE == "stage2-amf-stad"
-IS_AMF = IS_AMF_STAGE1 or IS_AMF_STAGE1_RESUME or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2 or IS_AMF_STAD_STAGE2
+IS_AMF_STAD_STAGE3 = STAGE == "stage3-amf-stad"
+IS_AMF = IS_AMF_STAGE1 or IS_AMF_STAGE1_RESUME or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2 or IS_AMF_STAD_STAGE2 or IS_AMF_STAD_STAGE3
 IS_CROSSING_FINETUNE = STAGE == "crossing-finetune"
 IS_CROSSING_FINETUNE_S1 = STAGE == "crossing-finetune-s1"
 IS_CROSSING_FINETUNE_S1_RESUME = STAGE == "crossing-finetune-s1-resume"
@@ -121,6 +123,13 @@ elif IS_AMF_STAD_STAGE2:
     INSTANCE_TYPE = "ml.g5.12xlarge"
     NUM_INSTANCES = 1
     MAX_RUNTIME = 48 * 3600  # 8 epochs on 32-clip dataset; steps/epoch unknown, generous budget
+elif IS_AMF_STAD_STAGE3:
+    # Stage 3: ID consolidation — same STAD data, resume from stage-2 checkpoint.
+    DATA_BUCKET_PREFIX = "s3://hudl-experiments/touchdown/datasets/tracking_stad_v2"
+    OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_amf_stad_stage3_v1"
+    INSTANCE_TYPE = "ml.g5.12xlarge"
+    NUM_INSTANCES = 1
+    MAX_RUNTIME = 10 * 3600  # 3 epochs, generous buffer
 elif IS_MGPU_SMOKE:
     # Small 20-sequence dataset already in S3 (no download wait), but the
     # real multi-GPU instance — isolate GPU/EFA/distributed issues fast
@@ -172,7 +181,7 @@ compute_config = Compute(
     instance_type=INSTANCE_TYPE,
     instance_count=NUM_INSTANCES,
     keep_alive_period_in_seconds=0,
-    volume_size_in_gb=100 if (IS_REAL or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2 or IS_AMF_STAD_STAGE2) else 50,
+    volume_size_in_gb=100 if (IS_REAL or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2 or IS_AMF_STAD_STAGE2 or IS_AMF_STAD_STAGE3) else 50,
 )
 output_data_config = OutputDataConfig(s3_output_path=f"{OUTPUT_BUCKET_PREFIX}/output")
 checkpoint_config = CheckpointConfig(
@@ -207,6 +216,7 @@ model_trainer = ModelTrainer(
         "MLFLOW_EXPERIMENT_NAME": (
             "motip-amf-stage1" if (IS_AMF_STAGE1 or IS_AMF_STAGE1_RESUME)
             else "motip-amf-stage2" if (IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2)
+            else "motip-amf-stad-stage3" if IS_AMF_STAD_STAGE3
             else "motip-amf-stad-stage2" if IS_AMF_STAD_STAGE2
             else f"motip-hockey-{STAGE}"
         ),
@@ -245,6 +255,9 @@ PRETRAIN_PREFIX = (
     else "s3://hudl-experiments-v1/finlay/motip_amf_stage1_pretrain_v1/checkpoints/"
     "motip-hockey-stage1-amf-2026-08-16-10-09-44"
     if IS_AMF_STAD_STAGE2
+    else "s3://hudl-experiments-v1/finlay/motip_amf_stad_stage2_v1/checkpoints/"
+    "motip-hockey-stage2-amf-stad-2026-08-20-09-49-26"
+    if IS_AMF_STAD_STAGE3
     else "s3://hudl-experiments-v1/finlay/motip_hockey_smoketest/pretrain"
 )
 TRAIN_DATA_SOURCE = (
@@ -252,6 +265,7 @@ TRAIN_DATA_SOURCE = (
     else
     DATA_BUCKET_PREFIX if (IS_AMF_STAGE1 or IS_AMF_STAGE1_RESUME)  # amfb_detection/train/images/ is at root
     else DATA_BUCKET_PREFIX if IS_AMF_STAD_STAGE2  # STADTracking: train/ at bucket root, no sub_dir wrapper
+    else DATA_BUCKET_PREFIX if IS_AMF_STAD_STAGE3  # same STAD data as stage 2
     else f"{DATA_BUCKET_PREFIX}/motip_hockey_data" if IS_REAL
     else f"{DATA_BUCKET_PREFIX}/data/motip_hockey_data" if not (IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2)
     else f"{DATA_BUCKET_PREFIX}/motip_hockey_data"  # mounts AMFTracking/train/ at channel root

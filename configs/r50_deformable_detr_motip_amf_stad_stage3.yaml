@@ -1,0 +1,32 @@
+SUPER_CONFIG_PATH: ./configs/r50_deformable_detr_motip_sportsmot.yaml
+
+DATASETS: [STADTracking]
+DATASET_SPLITS: [train]
+
+INFERENCE_DATASET:
+
+SAMPLE_LENGTHS: [30, ]
+SAMPLE_STRIDE: 10
+START_FRAME_FRACTION: 0.2
+
+# Resume from stage-2 checkpoint via --resume-model in the entrypoint.
+DETR_PRETRAIN:
+RESUME_MODEL:
+RESUME_OPTIMIZER: False
+RESUME_SCHEDULER: False
+RESUME_STATES: False
+
+MISS_TOLERANCE: 30
+
+# Short ID-consolidation phase: low LR, no trajectory augmentation.
+EPOCHS: 3
+LR: 1.0e-5
+LR_BACKBONE_SCALE: 0.05
+SCHEDULER_MILESTONES: []
+SAVE_CHECKPOINT_PER_EPOCH: 1
+
+# Disable trajectory augmentations — model should learn to hold IDs.
+AUG_TRAJECTORY_SWITCH_PROB: 0.0
+AUG_TRAJECTORY_OCCLUSION_PROB: 0.0
+
+MAX_TRACKS: 0
