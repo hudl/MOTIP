@@ -179,7 +179,7 @@ def train_engine(config: dict):
                         switch_prob = p0 + (p1 - p0) * (epoch - e0) / (e1 - e0)
                         break
             train_dataset.set_aug_trajectory_switch_prob(switch_prob)
-            logger.info(fAUG_TRAJECTORY_SWITCH_PROB set to {switch_prob:.4f} for epoch {epoch}.)
+            logger.info(f"AUG_TRAJECTORY_SWITCH_PROB set to {switch_prob:.4f} for epoch {epoch}.")
         train_sampler.prepare_for_epoch(epoch=epoch)
         # Train one epoch:
         train_metrics = train_one_epoch(
