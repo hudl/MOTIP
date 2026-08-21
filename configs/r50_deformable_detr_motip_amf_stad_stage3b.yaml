@@ -29,6 +29,6 @@ SAVE_CHECKPOINT_PER_EPOCH: 1
 
 # Small switch prob — enough to train through crossings, not enough to destroy ID holding.
 AUG_TRAJECTORY_SWITCH_PROB: 0.1
-AUG_TRAJECTORY_OCCLUSION_PROB: 0.0
+AUG_TRAJECTORY_OCCLUSION_PROB: 0.1
 
 MAX_TRACKS: 0
