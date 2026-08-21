@@ -146,6 +146,9 @@ def train_engine(config: dict):
         else:
             for _ in range(0, train_states["start_epoch"]):
                 scheduler.step()
+        if not config.get("RESUME_STATES", True):
+            train_states["start_epoch"] = 0
+            train_states["global_step"] = 0
         logger.success(
             log=f"Resume the model from '{config['RESUME_MODEL']}', "
                 f"optimizer={config['RESUME_OPTIMIZER']}, "
