@@ -7,7 +7,7 @@ INFERENCE_DATASET:
 
 # Longer sequences, denser sampling, starting later in clips.
 # Goal: expose model to full-speed crossing / route-running phase.
-SAMPLE_LENGTHS: [60]
+SAMPLE_LENGTHS: [45]
 SAMPLE_INTERVALS: [2]
 SAMPLE_STRIDE: 10
 START_FRAME_FRACTION: 0.5  # allow starts in first half of play, not just first 20%
