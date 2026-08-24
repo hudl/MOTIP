@@ -1,0 +1,7 @@
+SUPER_CONFIG_PATH: ./configs/r50_deformable_detr_motip_amf_stad_stage3b.yaml
+
+# Continue from stage3b checkpoint_2 (epoch 2 complete).
+# RESUME_STATES: True keeps the epoch counter at 3.
+# EPOCHS: 6 runs epochs 3, 4, 5 — checkpoints save as checkpoint_3/4/5.
+EPOCHS: 6
+RESUME_STATES: True
