@@ -31,7 +31,7 @@ from sagemaker.modules.configs import (
 )
 from sagemaker.modules.train import ModelTrainer
 
-STAGE = sys.argv[1] if len(sys.argv) > 1 else "stage1"  # "stage1" | "stage2" | "stage1-real" | "stage2-real" | "mgpu-smoke" | "stage1-amf" | "stage2-amf" | "stage2-amf-resume" | "stage3-amf-stad" | "rfdetr-stage1-hockey"
+STAGE = sys.argv[1] if len(sys.argv) > 1 else "stage1"  # "stage1" | "stage2" | "stage1-real" | "stage2-real" | "mgpu-smoke" | "stage1-amf" | "stage2-amf" | "stage2-amf-resume" | "stage3-amf-stad" | "rfdetr-stage1-hockey" | "rfdetr-stage1-real"
 
 ENTRYPOINTS = {
     "stage1": "motip_sm_entrypoint.sh",
@@ -52,6 +52,7 @@ ENTRYPOINTS = {
     "stage3b-amf-stad": "motip_sm_entrypoint_stage3b_amf_stad.sh",
     "stage3b-continue-amf-stad": "motip_sm_entrypoint_stage3b_continue_amf_stad.sh",
     "rfdetr-stage1-hockey": "motip_sm_entrypoint_rfdetr_stage1_hockey.sh",
+    "rfdetr-stage1-real": "motip_sm_entrypoint_rfdetr_stage1_real.sh",
 }
 ENTRYPOINT = ENTRYPOINTS[STAGE]
 IS_REAL = STAGE.endswith("-real")
@@ -68,6 +69,7 @@ IS_AMF_STAD_STAGE3B = STAGE == "stage3b-amf-stad"
 IS_AMF_STAD_STAGE3B_CONTINUE = STAGE == "stage3b-continue-amf-stad"
 IS_AMF = IS_AMF_STAGE1 or IS_AMF_STAGE1_RESUME or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2 or IS_AMF_STAD_STAGE2 or IS_AMF_STAD_STAGE3 or IS_AMF_STAD_STAGE3B or IS_AMF_STAD_STAGE3B_CONTINUE
 IS_RFDETR_STAGE1_HOCKEY = STAGE == "rfdetr-stage1-hockey"
+IS_RFDETR_STAGE1_REAL = STAGE == "rfdetr-stage1-real"
 IS_CROSSING_FINETUNE = STAGE == "crossing-finetune"
 IS_CROSSING_FINETUNE_S1 = STAGE == "crossing-finetune-s1"
 IS_CROSSING_FINETUNE_S1_RESUME = STAGE == "crossing-finetune-s1-resume"
@@ -157,6 +159,12 @@ elif IS_RFDETR_STAGE1_HOCKEY:
     INSTANCE_TYPE = "ml.g5.2xlarge"   # single A10G — RF-DETR ViT-S fits comfortably
     NUM_INSTANCES = 1
     MAX_RUNTIME = 30 * 3600            # 20 epochs; expect ~20-24h on a single A10G
+elif IS_RFDETR_STAGE1_REAL:
+    DATA_BUCKET_PREFIX = "s3://hudl-experiments-v1/faceoff/metaflow/data/tracking_workgroup/tracking_experiments"
+    OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_rfdetr_stage1_real_v1"
+    INSTANCE_TYPE = "ml.g5.12xlarge"  # 4x A10G
+    NUM_INSTANCES = 1
+    MAX_RUNTIME = 6 * 3600  # 20 epochs; ~4-5h on 4x A10G
 elif IS_MGPU_SMOKE:
     # Small 20-sequence dataset already in S3 (no download wait), but the
     # real multi-GPU instance — isolate GPU/EFA/distributed issues fast
@@ -213,7 +221,7 @@ compute_config = Compute(
     instance_type=INSTANCE_TYPE,
     instance_count=NUM_INSTANCES,
     keep_alive_period_in_seconds=0,
-    volume_size_in_gb=100 if (IS_REAL or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2 or IS_AMF_STAD_STAGE2 or IS_AMF_STAD_STAGE3 or IS_AMF_STAD_STAGE3B or IS_AMF_STAD_STAGE3B_CONTINUE) else 50,
+    volume_size_in_gb=100 if (IS_REAL or IS_RFDETR_STAGE1_REAL or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2 or IS_AMF_STAD_STAGE2 or IS_AMF_STAD_STAGE3 or IS_AMF_STAD_STAGE3B or IS_AMF_STAD_STAGE3B_CONTINUE) else 50,
 )
 output_data_config = OutputDataConfig(s3_output_path=f"{OUTPUT_BUCKET_PREFIX}/output")
 checkpoint_config = CheckpointConfig(
@@ -309,12 +317,13 @@ TRAIN_DATA_SOURCE = (
     else DATA_BUCKET_PREFIX if IS_AMF_STAD_STAGE3B_CONTINUE  # same STAD data
     else f"{DATA_BUCKET_PREFIX}/motip_hockey_data" if IS_REAL
     else DATA_BUCKET_PREFIX if IS_RFDETR_STAGE1_HOCKEY  # channel root IS the data dir
+    else f"{DATA_BUCKET_PREFIX}/motip_hockey_data" if IS_RFDETR_STAGE1_REAL
     else f"{DATA_BUCKET_PREFIX}/data/motip_hockey_data" if not (IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2)
     else f"{DATA_BUCKET_PREFIX}/motip_hockey_data"  # mounts AMFTracking/train/ at channel root
 )
 
 input_data_config = [InputData(channel_name="train", data_source=TRAIN_DATA_SOURCE)]
-if not IS_RFDETR_STAGE1_HOCKEY:
+if not (IS_RFDETR_STAGE1_HOCKEY or IS_RFDETR_STAGE1_REAL):
     # RF-DETR loads DINOv2 backbone from HuggingFace; no S3 pretrain channel needed
     input_data_config.append(InputData(channel_name="pretrain", data_source=PRETRAIN_PREFIX))
 
