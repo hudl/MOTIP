@@ -53,6 +53,7 @@ class RuntimeTracker:
         self.only_detr = only_detr
         self.max_displacement_bh = max_displacement_bh
         self.num_id_vocabulary = get_model(model).num_id_vocabulary
+        self.num_classes = getattr(get_model(model), "num_classes", None)
 
         # Check for the legality of settings:
         assert self.assignment_protocol in ["hungarian", "id-max", "object-max", "object-priority", "id-priority"], \
@@ -207,6 +208,10 @@ class RuntimeTracker:
             "id": torch.tensor(
                 [self.id_label_to_id[_] for _ in id_labels.tolist()], dtype=torch.int64,
             ),
+            # Decoder output embeddings, one row per detection and in the same order as
+            # "bbox". These are what the id_decoder consumes to judge identity, so they
+            # are usable as appearance features by an external tracker.
+            "embed": output_embeds,
         }
 
         # Update id_queue:
@@ -228,7 +233,10 @@ class RuntimeTracker:
         logits = detr_out["pred_logits"][0]
         boxes = detr_out["pred_boxes"][0]
         output_embeds = detr_out["outputs"][0]
-        scores = logits.sigmoid()
+        # Slice to NUM_CLASSES channels before max: RF-DETR adds an extra
+        # background logit (num_classes+1 channels at build_model time).
+        nc = self.num_classes
+        scores = logits[..., :nc].sigmoid() if nc is not None else logits.sigmoid()
         scores, categories = torch.max(scores, dim=-1)
         area = boxes[:, 2] * self.bbox_unnorm[2] * boxes[:, 3] * self.bbox_unnorm[3]
         activate_indices = (scores > self.det_thresh) & (area > self.area_thresh)
