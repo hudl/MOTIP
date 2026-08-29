@@ -1,10 +1,19 @@
-# ------------------------------------------------------------------------------------------------
-# Deformable DETR
-# Copyright (c) 2020 SenseTime. All Rights Reserved.
+# ------------------------------------------------------------------------
+# RF-DETR
+# Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+# Modified from LW-DETR (https://github.com/Atten4Vis/LW-DETR)
+# Copyright (c) 2024 Baidu. All Rights Reserved.
+# ------------------------------------------------------------------------------------------------
+# Modified from Deformable DETR
+# Copyright (c) 2020 SenseTime. All Rights Reserved.
 # ------------------------------------------------------------------------------------------------
 # Modified from https://github.com/chengdazhi/Deformable-Convolution-V2-PyTorch/tree/pytorch_1.0.0
 # ------------------------------------------------------------------------------------------------
+"""
+Multi-Scale Deformable Attention Module
+"""
 
 from __future__ import absolute_import
 from __future__ import print_function
@@ -12,22 +21,25 @@ from __future__ import division
 
 import warnings
 import math
+import numpy as np
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.nn.init import xavier_uniform_, constant_
 
-from ..functions import MSDeformAttnFunction
+from ..functions import ms_deform_attn_core_pytorch
 
 
 def _is_power_of_2(n):
     if (not isinstance(n, int)) or (n < 0):
         raise ValueError("invalid input for _is_power_of_2: {} (type: {})".format(n, type(n)))
-    return (n & (n-1) == 0) and n != 0
+    return (n & (n - 1) == 0) and n != 0
 
 
 class MSDeformAttn(nn.Module):
+    """Multi-Scale Deformable Attention Module
+    """
     def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4):
         """
         Multi-Scale Deformable Attention Module
@@ -42,7 +54,8 @@ class MSDeformAttn(nn.Module):
         _d_per_head = d_model // n_heads
         # you'd better set _d_per_head to a power of 2 which is more efficient in our CUDA implementation
         if not _is_power_of_2(_d_per_head):
-            warnings.warn("You'd better set d_model in MSDeformAttn to make the dimension of each attention head a power of 2 "
+            warnings.warn("You'd better set d_model in MSDeformAttn to make the "
+                          "dimension of each attention head a power of 2 "
                           "which is more efficient in our CUDA implementation.")
 
         self.im2col_step = 64
@@ -58,12 +71,20 @@ class MSDeformAttn(nn.Module):
         self.output_proj = nn.Linear(d_model, d_model)
 
         self._reset_parameters()
+        
+        self._export = False
+
+    def export(self):
+        """export mode
+        """
+        self._export = True
 
     def _reset_parameters(self):
         constant_(self.sampling_offsets.weight.data, 0.)
         thetas = torch.arange(self.n_heads, dtype=torch.float32) * (2.0 * math.pi / self.n_heads)
         grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
-        grid_init = (grid_init / grid_init.abs().max(-1, keepdim=True)[0]).view(self.n_heads, 1, 1, 2).repeat(1, self.n_levels, self.n_points, 1)
+        grid_init = (grid_init / grid_init.abs().max(-1, keepdim=True)
+                     [0]).view(self.n_heads, 1, 1, 2).repeat(1, self.n_levels, self.n_points, 1)
         for i in range(self.n_points):
             grid_init[:, :, i, :] *= i + 1
         with torch.no_grad():
@@ -75,7 +96,8 @@ class MSDeformAttn(nn.Module):
         xavier_uniform_(self.output_proj.weight.data)
         constant_(self.output_proj.bias.data, 0.)
 
-    def forward(self, query, reference_points, input_flatten, input_spatial_shapes, input_level_start_index, input_padding_mask=None):
+    def forward(self, query, reference_points, input_flatten, input_spatial_shapes,
+                input_level_start_index, input_padding_mask=None):
         """
         :param query                       (N, Length_{query}, C)
         :param reference_points            (N, Length_{query}, n_levels, 2), range in [0, 1], top-left (0,0), bottom-right (1, 1), including padding area
@@ -94,10 +116,10 @@ class MSDeformAttn(nn.Module):
         value = self.value_proj(input_flatten)
         if input_padding_mask is not None:
             value = value.masked_fill(input_padding_mask[..., None], float(0))
-        value = value.view(N, Len_in, self.n_heads, self.d_model // self.n_heads)
+
         sampling_offsets = self.sampling_offsets(query).view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
         attention_weights = self.attention_weights(query).view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
-        attention_weights = F.softmax(attention_weights, -1).view(N, Len_q, self.n_heads, self.n_levels, self.n_points)
+
         # N, Len_q, n_heads, n_levels, n_points, 2
         if reference_points.shape[-1] == 2:
             offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
@@ -109,37 +131,10 @@ class MSDeformAttn(nn.Module):
         else:
             raise ValueError(
                 'Last dim of reference_points must be 2 or 4, but get {} instead.'.format(reference_points.shape[-1]))
+        attention_weights = F.softmax(attention_weights, -1)
 
-        # for amp
-        if value.dtype == torch.float16:
-            # for mixed precision
-            # output = MSDeformAttnFunction.apply(
-            #     value.to(torch.float32), input_spatial_shapes, input_level_start_index, sampling_locations.to(torch.float32), attention_weights, self.im2col_step
-            # )
-            output = MSDeformAttnFunction.apply(
-                value.to(torch.float32), input_spatial_shapes, input_level_start_index,
-                sampling_locations.to(torch.float32), attention_weights.to(torch.float32), self.im2col_step
-            )
-            output = output.to(torch.float16)
-            output = self.output_proj(output)
-            return output
-
-        # for BF16:
-        if value.dtype == torch.bfloat16:
-            # for mixed precision
-            # attention_weights needs the same fp32 cast as value/sampling_locations:
-            # the compiled kernel is fp32-only and rejects a mixed-dtype call with
-            # "expected scalar type Float but found BFloat16".
-            output = MSDeformAttnFunction.apply(
-                value.to(torch.float32), input_spatial_shapes, input_level_start_index,
-                sampling_locations.to(torch.float32), attention_weights.to(torch.float32),
-                self.im2col_step)
-            output = output.to(torch.bfloat16)
-            output = self.output_proj(output)
-            return output
-
-
-        output = MSDeformAttnFunction.apply(
-            value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
+        value = value.transpose(1, 2).contiguous().view(N, self.n_heads, self.d_model // self.n_heads, Len_in)
+        output = ms_deform_attn_core_pytorch(
+            value, input_spatial_shapes, sampling_locations, attention_weights)
         output = self.output_proj(output)
         return output

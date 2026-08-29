@@ -1,0 +1,45 @@
+# RF-DETR stage-2 smoke test: full MOTIP with RF-DETR medium as the detector.
+#
+# Stage 1 (detection pretrain): run pretrain_rfdetr_hockey_smoketest.yaml first,
+# then set DETR_PRETRAIN below to the best stage-1 checkpoint.
+#
+# Differences from the D-DETR hockey smoketest:
+#   - DETR_FRAMEWORK: rf_detr
+#   - DETR_TWO_STAGE: True  (RF-DETR always uses two-stage)
+#   - DETR_WITH_BOX_REFINE / DETR_NUM_FEATURE_LEVELS / backbone fields are
+#     ignored for RF-DETR but left at their defaults so the criterion builds.
+#   - RFDETR_* keys configure the RF-DETR medium architecture.
+#   - LR_LINEAR_PROJ_NAMES adds refpoint_embed (RF-DETR uses this instead of
+#     reference_points; falls into full-LR catch-all without the fix).
+#   - LR_BACKBONE_NAMES: [backbone.0] still matches DINOv2 via substring.
+
+SUPER_CONFIG_PATH: ./configs/r50_deformable_detr_motip_sportsmot.yaml
+
+# --- Framework override ---
+DETR_FRAMEWORK: rf_detr
+DETR_TWO_STAGE: True
+DETR_HIDDEN_DIM: 256
+
+# --- RF-DETR medium architecture ---
+RFDETR_ENCODER: dinov2_windowed_small
+RFDETR_VIT_ENCODER_NUM_LAYERS: 12
+RFDETR_OUT_FEATURE_INDEXES: [3, 6, 9, 12]
+RFDETR_PROJECTOR_SCALE: [P4]
+RFDETR_DEC_LAYERS: 4
+RFDETR_PATCH_SIZE: 14
+RFDETR_NUM_WINDOWS: 2
+RFDETR_POSITIONAL_ENCODING_SIZE: 37
+RFDETR_RESOLUTION: 560
+RFDETR_GROUP_DETR: 1
+RFDETR_LITE_REFPOINT_REFINE: True
+RFDETR_BBOX_REPARAM: True
+
+# --- Data ---
+DATASETS: [Hockey]
+DATASET_SPLITS: [train]
+INFERENCE_DATASET:
+
+# --- LR param groups ---
+# refpoint_embed is RF-DETR's equivalent of D-DETR's reference_points.
+# Without it the refpoint_embed weights fall into the full-LR catch-all.
+LR_LINEAR_PROJ_NAMES: [reference_points, sampling_offsets, refpoint_embed]
