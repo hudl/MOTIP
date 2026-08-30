@@ -38,7 +38,7 @@ def train_engine(config: dict):
 
     # Init Accelerator at beginning:
     # RF-DETR has params unused in some forward passes (windowed attn); DDP requires find_unused_parameters=True
-    _ddp_kwargs = [DistributedDataParallelKwargs(find_unused_parameters=True)] if config.get(DETR_FRAMEWORK) == rf_detr else []
+    _ddp_kwargs = [DistributedDataParallelKwargs(find_unused_parameters=True)] if config.get("DETR_FRAMEWORK") == "rf_detr" else []
     accelerator = Accelerator(kwargs_handlers=_ddp_kwargs)
     state = PartialState()
     # Also, we set the seed:
