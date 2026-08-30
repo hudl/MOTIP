@@ -6,6 +6,7 @@ import torch
 import einops
 from accelerate import Accelerator
 from accelerate.state import PartialState
+from accelerate.utils import DistributedDataParallelKwargs
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import MultiStepLR
@@ -36,7 +37,9 @@ def train_engine(config: dict):
         else os.path.join("./outputs/", config["EXP_NAME"])
 
     # Init Accelerator at beginning:
-    accelerator = Accelerator()
+    # RF-DETR has params unused in some forward passes (windowed attn); DDP requires find_unused_parameters=True
+    _ddp_kwargs = [DistributedDataParallelKwargs(find_unused_parameters=True)] if config.get(DETR_FRAMEWORK) == rf_detr else []
+    accelerator = Accelerator(kwargs_handlers=_ddp_kwargs)
     state = PartialState()
     # Also, we set the seed:
     set_seed(config["SEED"])
