@@ -32,7 +32,8 @@ class DanceTrack(OneDataset):
         return
 
     def _get_sequence_names(self):
-        return os.listdir(os.path.join(self.data_dir, self.split))
+        base = os.path.join(self.data_dir, self.split)
+        return [e for e in os.listdir(base) if os.path.isdir(os.path.join(base, e))]
 
     def _get_sequence_infos(self):
         sequence_names = self._get_sequence_names()
