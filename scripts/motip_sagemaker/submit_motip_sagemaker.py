@@ -164,7 +164,7 @@ elif IS_RFDETR_STAGE1_REAL:
     OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_rfdetr_stage1_real_v1"
     INSTANCE_TYPE = "ml.g5.12xlarge"  # 4x A10G
     NUM_INSTANCES = 1
-    MAX_RUNTIME = 6 * 3600  # 20 epochs; ~4-5h on 4x A10G
+    MAX_RUNTIME = 90 * 3600  # 20 epochs x ~3.8h each = ~76h on 4x A10G (DINOv2 is slower than ResNet-50)
 elif IS_MGPU_SMOKE:
     # Small 20-sequence dataset already in S3 (no download wait), but the
     # real multi-GPU instance — isolate GPU/EFA/distributed issues fast
