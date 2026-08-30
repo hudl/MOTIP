@@ -1,4 +1,5 @@
 SUPER_CONFIG_PATH: ./configs/rfdetr_motip_hockey_smoketest.yaml
+DETR_PRETRAIN:                  # RF-DETR loads DINOv2 from HuggingFace; no D-DETR pretrain needed
 
 SAMPLE_LENGTHS: [1, ]
 DETR_NUM_TRAIN_FRAMES: 100
