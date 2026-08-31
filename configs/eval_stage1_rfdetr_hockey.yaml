@@ -1,0 +1,5 @@
+SUPER_CONFIG_PATH: ./configs/pretrain_rfdetr_hockey_real.yaml
+
+INFERENCE_DATASET: Hockey
+INFERENCE_SPLIT: val
+INFERENCE_MODE: evaluate
