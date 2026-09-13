@@ -1,0 +1,3 @@
+SUPER_CONFIG_PATH: ./configs/eval_stage1_rfdetr_hockey_iabce.yaml
+ONLY_DETR: False
+RFDETR_GROUP_DETR: 1

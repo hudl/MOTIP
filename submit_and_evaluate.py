@@ -241,6 +241,21 @@ def submit_and_evaluate_one_model(
                 os.makedirs(os.path.join(outputs_dir, "tracker"), exist_ok=True)
                 with open(os.path.join(outputs_dir, "tracker", f"{sequence_name}.txt"), "w") as submit_file:
                     submit_file.writelines(sequence_tracker_results)
+                # Per-detection decoder embeddings, row-aligned with the txt lines written
+                # above (frame_<t> holds the rows for txt frame t+1). Opt-in via env var so
+                # ordinary tracking runs don't pay the I/O.
+                if os.environ.get("MOTIP_SAVE_EMBEDS"):
+                    import numpy as _np
+                    _embeds = {}
+                    for t in range(len(sequence_results)):
+                        _e = sequence_results[t].get("embed")
+                        if _e is None or len(_e) == 0:
+                            _embeds[f"frame_{t}"] = _np.zeros((0, 0), dtype=_np.float32)
+                        else:
+                            _embeds[f"frame_{t}"] = _e.float().cpu().numpy()
+                    _embed_path = os.path.join(outputs_dir, "tracker", f"{sequence_name}_embeds.npz")
+                    _np.savez_compressed(_embed_path, **_embeds)
+                    logger.success(f"Saved DETR embeddings to {_embed_path}.", only_main=False)
                 logger.success(f"Submit sequence {sequence_name} done, FPS: {sequence_fps:.2f}. "
                                f"Saved to {os.path.join(outputs_dir, 'tracker', f'{sequence_name}.txt')}.",
                                only_main=False)

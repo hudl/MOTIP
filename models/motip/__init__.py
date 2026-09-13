@@ -30,17 +30,20 @@ def _build_rf_detr(config, detr_args):
     # included in the SageMaker code channel and the local dev tree.
     # The top-level stub bypasses rfdetr/__init__.py's supervision import.
     if 'rfdetr' not in sys.modules:
-        _repo = _RFDETR_BUNDLED if os.path.isdir(os.path.join(_RFDETR_BUNDLED, 'rfdetr')) else _RFDETR_REPO
-        if _repo not in sys.path:
-            sys.path.insert(0, _repo)
         try:
-            import rfdetr  # noqa: F401
+            import rfdetr  # prefer pip-installed (e.g. 1.10.0) over bundled copy
         except ImportError:
-            import types
-            _stub = types.ModuleType('rfdetr')
-            _stub.__path__ = [os.path.join(_repo, 'rfdetr')]
-            _stub.__package__ = 'rfdetr'
-            sys.modules['rfdetr'] = _stub
+            _repo = _RFDETR_BUNDLED if os.path.isdir(os.path.join(_RFDETR_BUNDLED, 'rfdetr')) else _RFDETR_REPO
+            if _repo not in sys.path:
+                sys.path.insert(0, _repo)
+            try:
+                import rfdetr  # noqa: F401
+            except ImportError:
+                import types
+                _stub = types.ModuleType('rfdetr')
+                _stub.__path__ = [os.path.join(_repo, 'rfdetr')]
+                _stub.__package__ = 'rfdetr'
+                sys.modules['rfdetr'] = _stub
 
     from rfdetr.models.lwdetr import build_model as build_lwdetr
 
@@ -61,8 +64,8 @@ def _build_rf_detr(config, detr_args):
     rf_args.device = config["DEVICE"]
     rf_args.num_queries = config["DETR_NUM_QUERIES"]
     rf_args.aux_loss = config["DETR_AUX_LOSS"]
-    # group_detr must be 1: train-time pred_logits otherwise has 3900 queries
-    # and Hungarian would match across all groups rather than independently.
+    # group_detr: native RF-DETR 1.10.0 uses 13 groups (3900 queries); rfdetr criterion handles
+
     rf_args.group_detr = config.get("RFDETR_GROUP_DETR", 1)
     rf_args.two_stage = config["DETR_TWO_STAGE"]
     rf_args.lite_refpoint_refine = config.get("RFDETR_LITE_REFPOINT_REFINE", True)
@@ -83,16 +86,18 @@ def _build_rf_detr(config, detr_args):
     rf_args.encoder_only = False
     rf_args.backbone_only = False
     rf_args.segmentation_head = False
-    rf_args.ia_bce_loss = False      # stage-1 loss; not used in MOTIP training
+    rf_args.ia_bce_loss = config.get("IA_BCE_LOSS", False)
+    rf_args.dual_projector = False
+    rf_args.dual_projector_kp_only = False
     rf_args.use_varifocal_loss = False
     rf_args.use_position_supervised_loss = False
     rf_args.sum_group_losses = False
     # --- Transformer args (defaults from RF-DETR main.py) ---
     rf_args.sa_nheads = 8
-    rf_args.ca_nheads = 8
+    rf_args.ca_nheads = config.get("RFDETR_CA_NHEADS", 8)
     rf_args.dropout = 0.0
     rf_args.dim_feedforward = 2048
-    rf_args.dec_n_points = 4
+    rf_args.dec_n_points = config.get("RFDETR_DEC_N_POINTS", 4)
     rf_args.decoder_norm = "LN"
     rf_args.num_select = config.get("DETR_NUM_QUERIES", 300)
     # Loss coefs forwarded for completeness (MOTIP criterion uses detr_args values)
@@ -144,6 +149,7 @@ def _build_rf_detr(config, detr_args):
 
         def forward(self, samples):
             samples = self._pad_to_block(samples)
+            samples.no_padding = False  # rfdetr 1.10.0 backbone requires this attr
             result = self.base(samples=samples)
             if self._hs_last is not None:
                 result['outputs'] = self._hs_last[-1]
@@ -151,10 +157,65 @@ def _build_rf_detr(config, detr_args):
 
     detr_model = _RFDETRWithOutputs(_base, block_size=_block_size)
 
-    # Use MOTIP's architecture-agnostic criterion, not RF-DETR's IA-BCE variant.
-    # build_deformable_detr returns (model, criterion, postprocessors); we only
-    # need the criterion.
-    _, detr_criterion, _ = build_deformable_detr(args=detr_args)
+    # --- Criterion: use RF-DETR's own IA-BCE criterion so stage-1 training is
+    # identical to native RF-DETR training (same loss, same matcher, same LR schedule).
+    from rfdetr.models.lwdetr import build_criterion_and_postprocessors as _build_rfdetr_crit
+    import torch as _torch
+
+    # Matcher cost coefficients (same values as the D-DETR args, kept in sync via config).
+    rf_args.set_cost_class = detr_args.set_cost_class
+    rf_args.set_cost_bbox = detr_args.set_cost_bbox
+    rf_args.set_cost_giou = detr_args.set_cost_giou
+    rf_args.segmentation_head = False
+    rf_args.sum_group_losses = config.get("RFDETR_SUM_GROUP_LOSSES", False)
+
+    _rfdetr_crit, _ = _build_rfdetr_crit(rf_args)
+    _rfdetr_crit.to(_torch.device(config["DEVICE"]))
+
+    class _MotipCriterionWrapper:
+        """Wraps RF-DETR SetCriterion to match MOTIP's (loss_dict, indices) interface.
+
+        Stage 1 (ONLY_DETR=True): detr_indices are not consumed (prepare_for_motip
+        is skipped), so returning dummy indices is fine.
+
+        Stage 2 (ONLY_DETR=False): we re-run the matcher on just the first
+        num_queries (300) queries so prepare_for_motip gets clean 1-to-1
+        per-image assignments, independent of the group_detr=13 replication used
+        for the loss.  The extra matcher call is cheap relative to the forward pass.
+        """
+        def __init__(self, c, num_queries):
+            self._c = c
+            self._num_queries = num_queries
+            self.weight_dict = c.weight_dict
+
+        def __call__(self, outputs, targets, **kwargs):
+            losses = self._c(outputs, targets)
+            # Re-run matcher on first 300 queries only to get 1-to-1 assignments
+            # that prepare_for_motip expects (group_detr=13 gives 13*N matches).
+            single = {
+                "pred_logits": outputs["pred_logits"][:, :self._num_queries, :],
+                "pred_boxes":  outputs["pred_boxes"][:, :self._num_queries, :],
+            }
+            with _torch.no_grad():
+                indices = self._c.matcher(single, targets)
+            return losses, indices
+
+        def train(self, mode=True):
+            self._c.train(mode)
+            return self
+
+        def eval(self):
+            self._c.eval()
+            return self
+
+        def to(self, *args, **kwargs):
+            self._c.to(*args, **kwargs)
+            return self
+
+        def parameters(self):
+            return self._c.parameters()
+
+    detr_criterion = _MotipCriterionWrapper(_rfdetr_crit, num_queries=rf_args.num_queries)
 
     return detr_model, detr_criterion
 

@@ -1,0 +1,29 @@
+# RF-DETR MOTIP stage-2 — full MOTIP (detector + ID head) — Hockey dataset.
+# Detector backbone: RF-DETR medium, initialized from rfdetr_best_ema.pth
+# (native hockey-trained checkpoint from ihc-od SageMaker training).
+#
+# DETR_PRETRAIN is passed via --detr-pretrain CLI (points to SM_CHANNEL_PRETRAIN).
+
+SUPER_CONFIG_PATH: ./configs/rfdetr_motip_hockey_smoketest.yaml
+
+DATASETS: [Hockey]
+DATASET_SPLITS: [train]
+INFERENCE_DATASET:
+
+ONLY_DETR: False
+
+# Stage 2 trains the ID decoder; group_detr=1 matches D-DETR memory footprint.
+RFDETR_GROUP_DETR: 1
+
+# Stage-2 recipe (match D-DETR stage-2 hockey run)
+SAMPLE_LENGTHS: [60, ]
+EPOCHS: 13
+LR: 5.0e-5
+LR_WARMUP_EPOCHS: 1
+SCHEDULER_MILESTONES: [10, ]
+SCHEDULER_GAMMA: 0.1
+BATCH_SIZE: 1
+ACCUMULATE_STEPS: 1
+
+SAVE_CHECKPOINT_PER_EPOCH: 1
+EXP_NAME: rfdetr-motip-hockey-stage2
