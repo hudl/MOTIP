@@ -54,9 +54,9 @@ spec:
           volumeMounts:
             - name: workspace
               mountPath: /workspace
-          # AWS credentials via instance profile (EKS node role)
-          # No explicit secret needed if nodes have s3 access via IRSA/node role
-      serviceAccountName: default
+          # S3 access via node role (hudl-experiments-v1-node-group-iam-role)
+          # node-groups-s3-access policy covers hudl-experiments-v1, no IRSA needed
+      serviceAccountName: hudl-workflows-sa
       volumes:
         - name: workspace
           emptyDir:
