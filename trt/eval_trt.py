@@ -178,26 +178,23 @@ def main():
 
     print("\n--- PT fp32 ---")
     pt, cfg = _build_pt(args.checkpoint, args.num_classes)
-    import time; _t0 = time.perf_counter()
     pt_r = _run_tracker(pt, cfg, frame_paths, args.res, args.det_thresh, args.newborn_thresh)
     all_results["PT_fp32"] = pt_r
-    print(f"  {len(set(r[1] for r in pt_r))} unique IDs, {len(pt_r)} dets  |  {n/(time.perf_counter()-_t0):.1f} fps")
+    print(f"  {len(set(r[1] for r in pt_r))} unique IDs, {len(pt_r)} total dets")
     del pt; torch.cuda.empty_cache()
 
     print("\n--- TRT fp16 ---")
     trt16, cfg16 = _build_trt(args.fp16_engine, args.checkpoint, args.num_classes)
-    _t0 = time.perf_counter()
     trt16_r = _run_tracker(trt16, cfg16, frame_paths, args.res, args.det_thresh, args.newborn_thresh)
     all_results["TRT_fp16"] = trt16_r
-    print(f"  {len(set(r[1] for r in trt16_r))} unique IDs, {len(trt16_r)} dets  |  {n/(time.perf_counter()-_t0):.1f} fps")
+    print(f"  {len(set(r[1] for r in trt16_r))} unique IDs, {len(trt16_r)} total dets")
     del trt16; torch.cuda.empty_cache()
 
     print("\n--- TRT fp32 ---")
     trt32, cfg32 = _build_trt(args.fp32_engine, args.checkpoint, args.num_classes)
-    _t0 = time.perf_counter()
     trt32_r = _run_tracker(trt32, cfg32, frame_paths, args.res, args.det_thresh, args.newborn_thresh)
     all_results["TRT_fp32"] = trt32_r
-    print(f"  {len(set(r[1] for r in trt32_r))} unique IDs, {len(trt32_r)} dets  |  {n/(time.perf_counter()-_t0):.1f} fps")
+    print(f"  {len(set(r[1] for r in trt32_r))} unique IDs, {len(trt32_r)} total dets")
     del trt32; torch.cuda.empty_cache()
 
     # Save per-tracker results for visualization
