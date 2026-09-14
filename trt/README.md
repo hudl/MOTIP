@@ -4,6 +4,74 @@ RF-DETR stage-2 MOTIP → TensorRT engine: export, validate, benchmark, and eval
 
 ---
 
+## What was changed to make this work
+
+Everything in `trt/` is new. The changes below cover what had to be fixed or created to get a working TRT engine that matches PT fp32 behaviour.
+
+### Bug fixes in existing code
+
+**`trt/build_engine.py` — dec_layers detection (critical)**
+
+The original script used `RFDETRSmallConfig` which defaults to `dec_layers=3`. The MOTIP hockey checkpoint was trained with `dec_layers=4`. Exporting ONNX with 3 layers and running PT inference with 4 layers produces completely incompatible query embeddings (cosine sim ~0.58) which fragmented every track — 906 unique IDs instead of ~43.
+
+Fix: added `peek_checkpoint_hparams()` which counts decoder layer indices in the checkpoint weight keys to detect the real `dec_layers`, then passes it to `build_rfdetr()` as `dec_layers_override`. The engine now exports with the correct architecture.
+
+**`trt/compare_pt_trt.py` — RFDETR_GROUP_DETR config key**
+
+Added `"RFDETR_GROUP_DETR": 1` to `_motip_cfg()`. Without it, MOTIP raised a noisy shape-mismatch warning on `refpoint_embed` during model construction. Benign but obscured real errors.
+
+**`trt/eval_trt.py` — full checkpoint loading for PT baseline**
+
+An earlier version of `_build_pt` called `load_checkpoint(m.detr.base, ckpt)` which only loaded the detector weights. The trajectory decoder was left with random initialisation, producing ~1469 unique IDs. Fix: load the complete stage-2 checkpoint with a filtered `load_state_dict`:
+
+```python
+raw = ck.get("model", ck.get("state_dict", ck))
+filt = {k: v for k, v in raw.items() if k in msd and msd[k].shape == v.shape}
+m.load_state_dict(filt, strict=False)
+```
+
+**`trt/eval_trt.py` — TrackEval directory layout**
+
+Two separate path bugs:
+- Seqmap was being written inside `mot_challenge/` — TrackEval looks one level up, so it must be at `gt/seqmaps/{bench}-{split}.txt`
+- `TRACKERS_FOLDER` included the `{bench}-{split}` suffix — TrackEval appends that itself, so the tracker data ended up one level too deep
+
+**`trt/eval_trt.py` — RuntimeTracker constructor**
+
+`RuntimeTracker` requires explicit keyword args (`id_thresh`, `miss_tolerance`, `max_tracks`, `area_thresh`) that cannot be passed positionally. Added `cfg.get(...)` lookups for each.
+
+### New scripts
+
+| File | What it does |
+|------|-------------|
+| `trt/run.sh` | Devbox launcher — sets `LD_LIBRARY_PATH` to co-locate TRT 8.6 (cuDNN 8) with torch 2.8 (cuDNN 9). Every TRT script must be run through this on the devbox. |
+| `trt/build_engine.py` | ONNX export + TRT build. Detector mode (boxes/logits) or `--motip` mode (adds `query_embeds` output). Auto-detects `dec_layers` from checkpoint. |
+| `trt/compare_pt_trt.py` | Frame-by-frame cosine similarity between PT and TRT embeddings. Used to verify parity after a rebuild. |
+| `trt/eval_trt.py` | Runs all three trackers (PT fp32, TRT fp32, TRT fp16) on a clip, computes HOTA/MOTA/IDF1 via TrackEval, saves per-frame results JSON for rendering. |
+| `trt/render_3way.py` | Reads the results JSON (no model inference), renders a 3-panel side-by-side MP4: PT fp32 \| TRT fp32 \| TRT fp16. |
+| `trt/bench_detector.py` | Raw detector throughput: FPS at batch 1/2/4/8. |
+| `trt/bench_tracker.py` | ID head throughput (trajectory_modeling + id_decoder in isolation): eager vs CUDA graphs. |
+| `trt/validate_engine.py` | ONNX vs TRT output comparison (pre-integration sanity check). |
+| `trt/validate_real.py` | Per-frame detector output validation on real frames. |
+| `trt/determinism_check.py` | Repeated inference determinism check (TRT fp16 is non-deterministic across runs). |
+| `trt/warmup_check.py` | Warmup effect on timing — verifies engine latency stabilises. |
+| `trt/sagemaker/submit.py` | SageMaker job submission for TRT build + bench on a target GPU type (T4/A10G/L4). |
+| `trt/sagemaker/entrypoint.sh` | SageMaker job entrypoint — installs deps, builds engine, runs bench_detector + bench_tracker. |
+| `trt/k8s/job.yaml` | k8s Job spec targeting `GPU-G5-4` (A10G, SM86) with the NGC pytorch:23.09-py3 image (TRT 8.6.1 pre-installed). |
+| `trt/k8s/entrypoint.sh` | k8s job entrypoint — fetches MOTIP src + data from S3, builds SM86 engines, runs 3-way eval + render, uploads results. |
+
+### rfdetr vendoring removed
+
+`third_party/rfdetr/` (50 files) was deleted. rfdetr is now bundled at SageMaker staging time by `scripts/motip_sagemaker/prepare_motip_staging.sh`, which copies it from `ihc-od/third_party/rf-detr/rfdetr`. `models/motip/__init__.py` has a `_RFDETR_BUNDLED` fallback path for both pip-installed and bundled rfdetr.
+
+Related changes in `scripts/motip_sagemaker/`:
+- `prepare_motip_staging.sh` — added rfdetr bundle step
+- `submit_motip_sagemaker.py` — added `rfdetr-crossing-finetune` stage (`ml.g5.12xlarge`, 36h)
+- `watch_rfdetr_ckpts.sh` — fixed accelerate path (bare `accelerate` → `/workspaces/.venv/bin/accelerate`)
+- Added `motip_sm_entrypoint_rfdetr_crossing_finetune.sh`, `motip_sm_entrypoint_rfdetr_stage2_hockey_resume2.sh`, `watch_crossing_ckpts.sh`, `configs/finetune_crossing_rfdetr_v1.yaml`
+
+---
+
 ## Background
 
 MOTIP stage-2 is a two-part pipeline:
