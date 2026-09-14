@@ -56,6 +56,7 @@ ENTRYPOINTS = {
     "rfdetr-native-stage1-real": "motip_sm_entrypoint_rfdetr_native_stage1.sh",
     "rfdetr-stage2-hockey": "motip_sm_entrypoint_rfdetr_stage2_hockey.sh",
     "rfdetr-stage2-hockey-resume": "motip_sm_entrypoint_rfdetr_stage2_hockey_resume.sh",
+    "rfdetr-crossing-finetune": "motip_sm_entrypoint_rfdetr_crossing_finetune.sh",
     "stage1-stad-ablation": "motip_sm_entrypoint_stage1_stad_ablation.sh",
 }
 ENTRYPOINT = ENTRYPOINTS[STAGE]
@@ -78,6 +79,7 @@ IS_RFDETR_STAGE1_REAL = STAGE == "rfdetr-stage1-real"
 IS_RFDETR_NATIVE_STAGE1 = STAGE == "rfdetr-native-stage1-real"
 IS_RFDETR_STAGE2_HOCKEY = STAGE == "rfdetr-stage2-hockey"
 IS_RFDETR_STAGE2_HOCKEY_RESUME = STAGE == "rfdetr-stage2-hockey-resume"
+IS_RFDETR_CROSSING_FINETUNE = STAGE == "rfdetr-crossing-finetune"
 IS_CROSSING_FINETUNE = STAGE == "crossing-finetune"
 IS_CROSSING_FINETUNE_S1 = STAGE == "crossing-finetune-s1"
 IS_CROSSING_FINETUNE_S1_RESUME = STAGE == "crossing-finetune-s1-resume"
@@ -97,6 +99,12 @@ elif IS_CROSSING_FINETUNE_S1:
     INSTANCE_TYPE = "ml.g7e.12xlarge"
     NUM_INSTANCES = 1
     MAX_RUNTIME = 12 * 3600  # stride-1 longer sequences, ~8-10h expected
+elif IS_RFDETR_CROSSING_FINETUNE:
+    DATA_BUCKET_PREFIX = "s3://hudl-experiments-v1/faceoff/metaflow/data/tracking_workgroup/tracking_experiments/motip_crossing_dataset"
+    OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_rfdetr_crossing_finetune_v1"
+    INSTANCE_TYPE = "ml.g5.12xlarge"
+    NUM_INSTANCES = 1
+    MAX_RUNTIME = 36 * 3600  # 13 epochs on crossing dataset
 elif IS_CROSSING_FINETUNE:
     DATA_BUCKET_PREFIX = "s3://hudl-experiments-v1/faceoff/metaflow/data/tracking_workgroup/tracking_experiments/motip_crossing_dataset"
     OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_crossing_finetune_v2"
@@ -307,6 +315,9 @@ model_trainer = ModelTrainer(
 #   stage2-amf:         our own AMF stage-1 checkpoint (checkpoint_14 is the last one)
 #   stage2-amf-resume:  stage-2 checkpoint_1.pth (epoch 1, resume full training)
 PRETRAIN_PREFIX = (
+    "s3://hudl-experiments-v1/finlay/motip_rfdetr_stage2_hockey_v2/checkpoints/motip-hockey-rfdetr-stage2-hockey-resume-2026-09-13-11-26-49"
+    if IS_RFDETR_CROSSING_FINETUNE
+    else
     "s3://hudl-experiments-v1/finlay/motip_rfdetr_stage2_hockey_v2/checkpoints/motip-hockey-rfdetr-stage2-hockey-2026-09-07-17-58-12"
     if IS_RFDETR_STAGE2_HOCKEY_RESUME
     else
@@ -358,6 +369,7 @@ TRAIN_DATA_SOURCE = (
     else DATA_BUCKET_PREFIX if IS_AMF_STAD_STAGE3B_CONTINUE  # same STAD data
     else DATA_BUCKET_PREFIX if IS_STAD_ABLATION  # STAD v2 at channel root, no sub_dir wrapper
     else f"{DATA_BUCKET_PREFIX}/motip_hockey_data" if IS_REAL
+    else DATA_BUCKET_PREFIX if IS_RFDETR_CROSSING_FINETUNE  # crossing data layout
     else DATA_BUCKET_PREFIX if IS_RFDETR_STAGE2_HOCKEY_RESUME  # same data layout as original
     else DATA_BUCKET_PREFIX if IS_RFDETR_STAGE2_HOCKEY  # hockey stage-2 data root has Hockey/ subdir
     else DATA_BUCKET_PREFIX if IS_RFDETR_STAGE1_HOCKEY  # channel root IS the data dir
@@ -368,7 +380,7 @@ TRAIN_DATA_SOURCE = (
 )
 
 input_data_config = [InputData(channel_name="train", data_source=TRAIN_DATA_SOURCE)]
-if not (IS_RFDETR_STAGE1_HOCKEY or IS_RFDETR_STAGE1_REAL or IS_RFDETR_NATIVE_STAGE1) or IS_RFDETR_STAGE2_HOCKEY or IS_RFDETR_STAGE2_HOCKEY_RESUME:
+if not (IS_RFDETR_STAGE1_HOCKEY or IS_RFDETR_STAGE1_REAL or IS_RFDETR_NATIVE_STAGE1) or IS_RFDETR_STAGE2_HOCKEY or IS_RFDETR_STAGE2_HOCKEY_RESUME or IS_RFDETR_CROSSING_FINETUNE:
     # RF-DETR loads DINOv2 backbone from HuggingFace; no S3 pretrain channel needed
     input_data_config.append(InputData(channel_name="pretrain", data_source=PRETRAIN_PREFIX))
 
