@@ -1,0 +1,63 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: motip-trt-a10g
+  namespace: workflows
+spec:
+  ttlSecondsAfterFinished: 86400   # auto-clean after 24h
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        group: GPU-G5-4
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: motip-trt
+          image: nvcr.io/nvidia/pytorch:23.09-py3
+          imagePullPolicy: IfNotPresent
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              memory: "32Gi"
+              cpu: "8"
+            requests:
+              nvidia.com/gpu: "1"
+              memory: "16Gi"
+              cpu: "4"
+          env:
+            - name: S3_CHECKPOINT
+              value: "s3://hudl-experiments-v1/finlay/motip_trt_bench/checkpoints/trt_ckpt_cab8f975e423.pth"
+            - name: S3_DATA
+              value: "s3://hudl-experiments-v1/finlay/motip_trt_bench/data/005254c3"
+            - name: S3_OUT
+              value: "s3://hudl-experiments-v1/finlay/motip_trt_bench/a10g/small_576"
+            - name: MOTIP_BRANCH
+              value: "rf-detr"
+            - name: TRT_VARIANT
+              value: "small"
+            - name: TRT_RES
+              value: "576"
+            - name: N_FRAMES
+              value: "300"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              # fetch entrypoint from S3 and run
+              aws s3 cp s3://hudl-experiments-v1/finlay/motip_trt_bench/k8s/entrypoint.sh /entrypoint.sh
+              chmod +x /entrypoint.sh
+              exec /entrypoint.sh
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          # AWS credentials via instance profile (EKS node role)
+          # No explicit secret needed if nodes have s3 access via IRSA/node role
+      serviceAccountName: default
+      volumes:
+        - name: workspace
+          emptyDir:
+            sizeLimit: "20Gi"
