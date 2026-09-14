@@ -231,9 +231,9 @@ Measured on the devbox (SM75 / RTX 2080-class):
 
 | Variant | FPS | vs real-time (30fps) |
 |---------|-----|----------------------|
-| PT fp32 | 21 | 0.7× |
-| TRT fp32 | 28 | 0.9× |
-| TRT fp16 | **45** | **1.5×** |
+| PT fp32 | 14 | 0.5× |
+| TRT fp32 | 18 | 0.6× |
+| TRT fp16 | **28** | **0.9×** |
 
 The trajectory decoder runs in PyTorch on all three variants — it dominates over raw detector speed (which is ~140fps in isolation). fp16 is the production choice.
 
