@@ -94,9 +94,27 @@ class RuntimeTracker:
         return
 
     @torch.no_grad()
-    def update(self, image, suppress_boxes=None):
+    def update(self, image, suppress_boxes=None, _det_cache=None):
         detr_out = self.model(frames=image, part="detr")
         scores, categories, boxes, output_embeds = self._get_activate_detections(detr_out=detr_out)
+        if _det_cache is not None:
+            _det_cache.append((scores, categories, boxes, output_embeds))
+        self._process_detections(scores, categories, boxes, output_embeds, suppress_boxes)
+
+    @torch.no_grad()
+    def update_from_detections(self, scores, categories, boxes, output_embeds, suppress_boxes=None):
+        """Like update() but with pre-computed DETR outputs — skips the model forward pass.
+
+        ``scores``, ``categories``, ``boxes``, ``output_embeds`` are the outputs of
+        ``_get_activate_detections`` (already threshold-filtered), moved to the correct
+        device by the caller.  Using this path avoids re-running the backbone when
+        detections were already computed in a prior pass (e.g. a DETR pre-pass that
+        also served segment planning).
+        """
+        self._process_detections(scores, categories, boxes, output_embeds, suppress_boxes)
+
+    def _process_detections(self, scores, categories, boxes, output_embeds, suppress_boxes=None):
+        """Apply goalie suppression, ID decoder, trajectory update from pre-extracted detections."""
         # Suppress detections matching goalkeeper boxes
         if suppress_boxes is not None and len(suppress_boxes) > 0 and len(boxes) > 0:
             boxes_xyxy = box_cxcywh_to_xyxy(boxes) * self.bbox_unnorm

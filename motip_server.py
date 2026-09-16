@@ -17,11 +17,15 @@ import json
 import os
 import sys
 import time
-import multiprocessing
-multiprocessing.set_start_method("fork", force=True)
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.set_start_method("fork", force=True)
 
+import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision.transforms import v2
 
 # Add MOTIP to path
 MOTIP_ROOT = os.environ.get("MOTIP_ROOT", "/workspaces/sip-tracking-experiments/third_party/MOTIP")
@@ -35,6 +39,7 @@ from models.runtime_tracker import RuntimeTracker
 from models.motip import build as build_motip
 from models.misc import load_checkpoint
 from accelerate import Accelerator
+from utils.nested_tensor import nested_tensor_from_tensor_list
 
 
 def load_model(config_path: str, checkpoint_path: str):
@@ -46,7 +51,189 @@ def load_model(config_path: str, checkpoint_path: str):
     model, _ = build_motip(config=cfg)
     load_checkpoint(model, path=checkpoint_path)
     model = accelerator.prepare(model)
+    model.eval()
     return model, cfg, accelerator
+
+
+class NumpySeqDataset(Dataset):
+    """SeqDataset variant that serves in-memory BGR numpy frames instead of JPEG files.
+
+    Skips the encode→write→read→decode cycle. The transform pipeline is
+    identical to SeqDataset; only _load differs.
+    """
+
+    def __init__(self, frames, vid_w, vid_h, max_shorter=800, max_longer=1536,
+                 size_divisibility=0, dtype=torch.float32):
+        self.frames = frames
+        self.vid_w = vid_w
+        self.vid_h = vid_h
+        self.size_divisibility = size_divisibility
+        self.dtype = dtype
+        self.transform = v2.Compose([
+            v2.Resize(size=max_shorter, max_size=max_longer),
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True),
+            v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+    def __len__(self):
+        return len(self.frames)
+
+    def __getitem__(self, item):
+        image = self._load(self.frames[item])
+        transformed_image = self.transform(image)
+        if self.dtype != torch.float32:
+            transformed_image = transformed_image.to(self.dtype)
+        return nested_tensor_from_tensor_list([transformed_image], self.size_divisibility), item
+
+    def seq_hw(self):
+        return self.vid_h, self.vid_w
+
+    @staticmethod
+    def _load(frame):
+        # OpenCV gives BGR; PIL expects RGB.
+        return Image.fromarray(np.ascontiguousarray(frame[:, :, ::-1]))
+
+
+def run_detr_pass(model, cfg, frames: list, vid_w: int, vid_h: int) -> list:
+    """DETR-only forward over all frames. Returns a list of per-frame detection tuples.
+
+    Each element is ``(scores, categories, boxes, output_embeds)`` — CPU tensors,
+    already threshold-filtered by ``RuntimeTracker._get_activate_detections``.
+    Pass this as ``det_cache`` to ``run_sequence_from_frames`` to skip re-running
+    the backbone in the ID-assignment pass.
+    """
+    dtype_str = cfg.get("INFERENCE_DTYPE", "FP32")
+    dtype = torch.float16 if dtype_str == "FP16" else torch.float32
+
+    dataset = NumpySeqDataset(
+        frames=frames,
+        vid_w=vid_w,
+        vid_h=vid_h,
+        max_shorter=cfg.get("INFERENCE_MAX_SHORTER", 800),
+        max_longer=cfg.get("INFERENCE_MAX_LONGER", 1536),
+        size_divisibility=cfg.get("SIZE_DIVISIBILITY", 0),
+        dtype=dtype,
+    )
+    loader = DataLoader(
+        dataset=dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        collate_fn=lambda x: x[0],
+    )
+    # Temporary tracker just to call _get_activate_detections with the right thresholds.
+    _tracker = RuntimeTracker(
+        model=model,
+        sequence_hw=dataset.seq_hw(),
+        use_sigmoid=cfg.get("USE_FOCAL_LOSS", False),
+        assignment_protocol=cfg.get("ASSIGNMENT_PROTOCOL", "hungarian"),
+        miss_tolerance=cfg["MISS_TOLERANCE"],
+        det_thresh=cfg["DET_THRESH"],
+        newborn_thresh=cfg["NEWBORN_THRESH"],
+        id_thresh=cfg["ID_THRESH"],
+        area_thresh=cfg.get("AREA_THRESH", 0),
+        only_detr=True,
+        dtype=dtype,
+        max_tracks=cfg.get("MAX_TRACKS", 0),
+    )
+    det_cache = []
+    with torch.no_grad():
+        for image, _ in loader:
+            image.tensors = image.tensors.cuda()
+            image.mask = image.mask.cuda()
+            detr_out = model(frames=image, part="detr")
+            scores, categories, boxes, output_embeds = _tracker._get_activate_detections(detr_out)
+            det_cache.append((
+                scores.cpu(), categories.cpu(), boxes.cpu(), output_embeds.cpu(),
+            ))
+    return det_cache
+
+
+def run_sequence_from_frames(
+    model, cfg, frames: list, vid_w: int, vid_h: int,
+    det_cache: list | None = None,
+) -> dict:
+    """Run inference on pre-decoded BGR numpy frames. Returns {frame_1indexed: [detections]}.
+
+    Drop-in for run_sequence when frames are already in memory — no JPEG I/O.
+
+    Pass ``det_cache`` (a slice of the list returned by ``run_detr_pass``) to skip
+    re-running the DETR backbone entirely; only the ID decoder runs per frame.
+    """
+    dtype_str = cfg.get("INFERENCE_DTYPE", "FP32")
+    dtype = torch.float16 if dtype_str == "FP16" else torch.float32
+
+    sequence_hw = (vid_h, vid_w)
+    runtime_tracker = RuntimeTracker(
+        model=model,
+        sequence_hw=sequence_hw,
+        use_sigmoid=cfg.get("USE_FOCAL_LOSS", False),
+        assignment_protocol=cfg.get("ASSIGNMENT_PROTOCOL", "hungarian"),
+        miss_tolerance=cfg["MISS_TOLERANCE"],
+        det_thresh=cfg["DET_THRESH"],
+        newborn_thresh=cfg["NEWBORN_THRESH"],
+        id_thresh=cfg["ID_THRESH"],
+        area_thresh=cfg.get("AREA_THRESH", 0),
+        only_detr=(cfg.get("INFERENCE_ONLY_DETR", False)
+                   if cfg.get("INFERENCE_ONLY_DETR") is not None
+                   else cfg.get("ONLY_DETR", False)),
+        dtype=dtype,
+        max_tracks=cfg.get("MAX_TRACKS", 0),
+    )
+
+    results = {}
+
+    if det_cache is not None:
+        # Fast path: DETR already ran, only run ID decoder.
+        for t, (scores, categories, boxes, output_embeds) in enumerate(det_cache):
+            runtime_tracker.update_from_detections(
+                scores.to("cuda"), categories.to("cuda"),
+                boxes.to("cuda"), output_embeds.to("cuda", dtype=dtype),
+            )
+            track_results = runtime_tracker.get_track_results()
+            bboxes_cpu = track_results["bbox"].cpu()
+            ids_list = track_results["id"].tolist()
+            results[t + 1] = [
+                {"track_id": oid, "bbox": [x, y, x + w, y + h]}
+                for oid, (x, y, w, h) in zip(ids_list, bboxes_cpu.tolist())
+            ]
+        return results
+
+    # Normal path: run full model (DETR + ID decoder) per frame.
+    dataset = NumpySeqDataset(
+        frames=frames,
+        vid_w=vid_w,
+        vid_h=vid_h,
+        max_shorter=cfg.get("INFERENCE_MAX_SHORTER", 800),
+        max_longer=cfg.get("INFERENCE_MAX_LONGER", 1536),
+        size_divisibility=cfg.get("SIZE_DIVISIBILITY", 0),
+        dtype=dtype,
+    )
+    sequence_loader = DataLoader(
+        dataset=dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+        collate_fn=lambda x: x[0],
+    )
+
+    for t, (image, _) in enumerate(sequence_loader):
+        image.tensors = image.tensors.cuda()
+        image.mask = image.mask.cuda()
+        runtime_tracker.update(image=image)
+        track_results = runtime_tracker.get_track_results()
+
+        bboxes_cpu = track_results["bbox"].cpu()
+        ids_list = track_results["id"].tolist()
+        results[t + 1] = [
+            {"track_id": oid, "bbox": [x, y, x + w, y + h]}
+            for oid, (x, y, w, h) in zip(ids_list, bboxes_cpu.tolist())
+        ]
+
+    return results
 
 
 def run_sequence(model, cfg, seq_dir: str, seq_name: str) -> dict:
@@ -74,7 +261,7 @@ def run_sequence(model, cfg, seq_dir: str, seq_name: str) -> dict:
     sequence_dataset = SeqDataset(
         seq_info=seq_info,
         image_paths=image_paths,
-        max_shorter=800,
+        max_shorter=cfg.get("INFERENCE_MAX_SHORTER", 800),
         max_longer=cfg.get("INFERENCE_MAX_LONGER", 1536),
         size_divisibility=cfg.get("SIZE_DIVISIBILITY", 0),
         dtype=dtype,
@@ -111,18 +298,12 @@ def run_sequence(model, cfg, seq_dir: str, seq_name: str) -> dict:
         runtime_tracker.update(image=image)
         track_results = runtime_tracker.get_track_results()
 
-        frame_dets = []
-        for obj_id, score, category, bbox in zip(
-            track_results["id"],
-            track_results["score"],
-            track_results["category"],
-            track_results["bbox"],
-        ):
-            x, y, w, h = bbox[0].item(), bbox[1].item(), bbox[2].item(), bbox[3].item()
-            frame_dets.append({
-                "track_id": obj_id.item(),
-                "bbox": [x, y, x + w, y + h],
-            })
+        bboxes_cpu = track_results["bbox"].cpu()
+        ids_list = track_results["id"].tolist()
+        frame_dets = [
+            {"track_id": oid, "bbox": [x, y, x + w, y + h]}
+            for oid, (x, y, w, h) in zip(ids_list, bboxes_cpu.tolist())
+        ]
         results[t + 1] = frame_dets
 
     return results
