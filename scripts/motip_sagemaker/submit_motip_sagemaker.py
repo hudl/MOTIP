@@ -9,6 +9,7 @@ proven building blocks (IAM role, bucket convention, ModelTrainer,
 image_uris.retrieve) directly, with a MOTIP-specific entrypoint.
 """
 import os
+import subprocess
 import sys
 from datetime import datetime
 
@@ -30,7 +31,7 @@ from sagemaker.modules.configs import (
 )
 from sagemaker.modules.train import ModelTrainer
 
-STAGE = sys.argv[1] if len(sys.argv) > 1 else "stage1"  # "stage1" | "stage2" | "stage1-real" | "stage2-real" | "mgpu-smoke" | "stage1-amf" | "stage2-amf" | "stage2-amf-resume" | "stage3-amf-stad"
+STAGE = sys.argv[1] if len(sys.argv) > 1 else "stage1"  # "stage1" | "stage2" | "stage1-real" | "stage2-real" | "mgpu-smoke" | "stage1-amf" | "stage2-amf" | "stage2-amf-resume" | "stage3-amf-stad" | "rfdetr-stage1-hockey" | "rfdetr-stage1-real" | "rfdetr-native-stage1-real"
 
 ENTRYPOINTS = {
     "stage1": "motip_sm_entrypoint.sh",
@@ -50,6 +51,13 @@ ENTRYPOINTS = {
     "stage3-amf-stad": "motip_sm_entrypoint_stage3_amf_stad.sh",
     "stage3b-amf-stad": "motip_sm_entrypoint_stage3b_amf_stad.sh",
     "stage3b-continue-amf-stad": "motip_sm_entrypoint_stage3b_continue_amf_stad.sh",
+    "rfdetr-stage1-hockey": "motip_sm_entrypoint_rfdetr_stage1_hockey.sh",
+    "rfdetr-stage1-real": "motip_sm_entrypoint_rfdetr_stage1_real.sh",
+    "rfdetr-native-stage1-real": "motip_sm_entrypoint_rfdetr_native_stage1.sh",
+    "rfdetr-stage2-hockey": "motip_sm_entrypoint_rfdetr_stage2_hockey.sh",
+    "rfdetr-stage2-hockey-resume": "motip_sm_entrypoint_rfdetr_stage2_hockey_resume.sh",
+    "rfdetr-crossing-finetune": "motip_sm_entrypoint_rfdetr_crossing_finetune.sh",
+    "stage1-stad-ablation": "motip_sm_entrypoint_stage1_stad_ablation.sh",
 }
 ENTRYPOINT = ENTRYPOINTS[STAGE]
 IS_REAL = STAGE.endswith("-real")
@@ -64,7 +72,14 @@ IS_AMF_STAD_STAGE2 = STAGE == "stage2-amf-stad"
 IS_AMF_STAD_STAGE3 = STAGE == "stage3-amf-stad"
 IS_AMF_STAD_STAGE3B = STAGE == "stage3b-amf-stad"
 IS_AMF_STAD_STAGE3B_CONTINUE = STAGE == "stage3b-continue-amf-stad"
-IS_AMF = IS_AMF_STAGE1 or IS_AMF_STAGE1_RESUME or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2 or IS_AMF_STAD_STAGE2 or IS_AMF_STAD_STAGE3 or IS_AMF_STAD_STAGE3B or IS_AMF_STAD_STAGE3B_CONTINUE
+IS_STAD_ABLATION = STAGE == "stage1-stad-ablation"
+IS_AMF = IS_AMF_STAGE1 or IS_AMF_STAGE1_RESUME or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2 or IS_AMF_STAD_STAGE2 or IS_AMF_STAD_STAGE3 or IS_AMF_STAD_STAGE3B or IS_AMF_STAD_STAGE3B_CONTINUE or IS_STAD_ABLATION
+IS_RFDETR_STAGE1_HOCKEY = STAGE == "rfdetr-stage1-hockey"
+IS_RFDETR_STAGE1_REAL = STAGE == "rfdetr-stage1-real"
+IS_RFDETR_NATIVE_STAGE1 = STAGE == "rfdetr-native-stage1-real"
+IS_RFDETR_STAGE2_HOCKEY = STAGE == "rfdetr-stage2-hockey"
+IS_RFDETR_STAGE2_HOCKEY_RESUME = STAGE == "rfdetr-stage2-hockey-resume"
+IS_RFDETR_CROSSING_FINETUNE = STAGE == "rfdetr-crossing-finetune"
 IS_CROSSING_FINETUNE = STAGE == "crossing-finetune"
 IS_CROSSING_FINETUNE_S1 = STAGE == "crossing-finetune-s1"
 IS_CROSSING_FINETUNE_S1_RESUME = STAGE == "crossing-finetune-s1-resume"
@@ -84,6 +99,12 @@ elif IS_CROSSING_FINETUNE_S1:
     INSTANCE_TYPE = "ml.g7e.12xlarge"
     NUM_INSTANCES = 1
     MAX_RUNTIME = 12 * 3600  # stride-1 longer sequences, ~8-10h expected
+elif IS_RFDETR_CROSSING_FINETUNE:
+    DATA_BUCKET_PREFIX = "s3://hudl-experiments-v1/faceoff/metaflow/data/tracking_workgroup/tracking_experiments/motip_crossing_dataset"
+    OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_rfdetr_crossing_finetune_v1"
+    INSTANCE_TYPE = "ml.g5.12xlarge"
+    NUM_INSTANCES = 1
+    MAX_RUNTIME = 36 * 3600  # 13 epochs on crossing dataset
 elif IS_CROSSING_FINETUNE:
     DATA_BUCKET_PREFIX = "s3://hudl-experiments-v1/faceoff/metaflow/data/tracking_workgroup/tracking_experiments/motip_crossing_dataset"
     OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_crossing_finetune_v2"
@@ -148,6 +169,45 @@ elif IS_AMF_STAD_STAGE3B_CONTINUE:
     INSTANCE_TYPE = "ml.g5.12xlarge"
     NUM_INSTANCES = 1
     MAX_RUNTIME = 48 * 3600  # 3 more epochs x ~6h each
+elif IS_RFDETR_STAGE1_HOCKEY:
+    DATA_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_hockey_smoketest/data/motip_hockey_data/Hockey"
+    OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_rfdetr_stage1_hockey"
+    INSTANCE_TYPE = "ml.g5.2xlarge"   # single A10G — RF-DETR ViT-S fits comfortably
+    NUM_INSTANCES = 1
+    MAX_RUNTIME = 30 * 3600            # 20 epochs; expect ~20-24h on a single A10G
+elif IS_RFDETR_STAGE1_REAL:
+    DATA_BUCKET_PREFIX = "s3://hudl-experiments-v1/faceoff/metaflow/data/tracking_workgroup/tracking_experiments"
+    OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_rfdetr_stage1_real_v1"
+    INSTANCE_TYPE = "ml.g5.12xlarge"  # 4x A10G
+    NUM_INSTANCES = 1
+    MAX_RUNTIME = 90 * 3600  # 20 epochs x ~3.8h each = ~76h on 4x A10G (DINOv2 is slower than ResNet-50)
+elif IS_RFDETR_NATIVE_STAGE1:
+    DATA_BUCKET_PREFIX = "s3://hudl-experiments-v1/faceoff/metaflow/data/tracking_workgroup/tracking_experiments"
+    OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_rfdetr_native_stage1_v1"
+    INSTANCE_TYPE = "ml.g5.12xlarge"  # 4x A10G
+    NUM_INSTANCES = 1
+    MAX_RUNTIME = 72 * 3600  # 20 epochs; RF-DETR native is faster than MOTIP harness (~3h/epoch on 4x A10G)
+elif IS_RFDETR_STAGE2_HOCKEY:
+    DATA_BUCKET_PREFIX = "s3://hudl-experiments-v1/faceoff/metaflow/data/tracking_workgroup/tracking_experiments/motip_hockey_data"
+    OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_rfdetr_stage2_hockey_v2"
+    INSTANCE_TYPE = "ml.g5.12xlarge"   # 4x A10G — same as D-DETR stage-2 hockey
+    NUM_INSTANCES = 1
+    MAX_RUNTIME = 72 * 3600             # 13 epochs on full dataset; D-DETR took ~16h, allow headroom
+elif IS_RFDETR_STAGE2_HOCKEY_RESUME:
+    DATA_BUCKET_PREFIX = "s3://hudl-experiments-v1/faceoff/metaflow/data/tracking_workgroup/tracking_experiments/motip_hockey_data"
+    OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_rfdetr_stage2_hockey_v2"
+    INSTANCE_TYPE = "ml.g5.12xlarge"
+    NUM_INSTANCES = 1
+    MAX_RUNTIME = 72 * 3600             # epochs 5-8: ~4 epochs x ~14h each
+elif IS_STAD_ABLATION:
+    # Ablation: DETR detection-only training on STAD v2 data.
+    # Same strategy as stage1-amf (no ID decoder), same data as stage2-amf-stad.
+    # Isolates data vs training-strategy effect on DetA.
+    DATA_BUCKET_PREFIX = "s3://hudl-experiments/touchdown/datasets/tracking_stad_v2"
+    OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_stad_detr_pretrain_ablation"
+    INSTANCE_TYPE = "ml.g5.12xlarge"
+    NUM_INSTANCES = 1
+    MAX_RUNTIME = 30 * 3600  # 20 epochs; expect ~24h on 4x A10G
 elif IS_MGPU_SMOKE:
     # Small 20-sequence dataset already in S3 (no download wait), but the
     # real multi-GPU instance — isolate GPU/EFA/distributed issues fast
@@ -193,13 +253,18 @@ pytorch_image_uri = sagemaker.image_uris.retrieve(
 )
 print(f"Using image: {pytorch_image_uri}")
 
+_prepare = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prepare_motip_staging.sh")
+print("Preparing staging directory...")
+subprocess.run(["bash", _prepare], check=True)
+print(f"Staging ready at {SOURCE_DIR}")
+
 source_code = SourceCode(source_dir=SOURCE_DIR, command=f"bash {ENTRYPOINT}")
 
 compute_config = Compute(
     instance_type=INSTANCE_TYPE,
     instance_count=NUM_INSTANCES,
     keep_alive_period_in_seconds=0,
-    volume_size_in_gb=100 if (IS_REAL or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2 or IS_AMF_STAD_STAGE2 or IS_AMF_STAD_STAGE3 or IS_AMF_STAD_STAGE3B or IS_AMF_STAD_STAGE3B_CONTINUE) else 50,
+    volume_size_in_gb=100 if (IS_REAL or IS_RFDETR_STAGE1_REAL or IS_RFDETR_NATIVE_STAGE1 or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2 or IS_AMF_STAD_STAGE2 or IS_AMF_STAD_STAGE3 or IS_AMF_STAD_STAGE3B or IS_AMF_STAD_STAGE3B_CONTINUE or IS_STAD_ABLATION) else 50,
 )
 output_data_config = OutputDataConfig(s3_output_path=f"{OUTPUT_BUCKET_PREFIX}/output")
 checkpoint_config = CheckpointConfig(
@@ -250,6 +315,15 @@ model_trainer = ModelTrainer(
 #   stage2-amf:         our own AMF stage-1 checkpoint (checkpoint_14 is the last one)
 #   stage2-amf-resume:  stage-2 checkpoint_1.pth (epoch 1, resume full training)
 PRETRAIN_PREFIX = (
+    "s3://hudl-experiments-v1/finlay/motip_rfdetr_stage2_hockey_v2/checkpoints/motip-hockey-rfdetr-stage2-hockey-resume-2026-09-13-11-26-49"
+    if IS_RFDETR_CROSSING_FINETUNE
+    else
+    "s3://hudl-experiments-v1/finlay/motip_rfdetr_stage2_hockey_v2/checkpoints/motip-hockey-rfdetr-stage2-hockey-2026-09-07-17-58-12"
+    if IS_RFDETR_STAGE2_HOCKEY_RESUME
+    else
+    "s3://hudl-experiments-v1/finlay/motip_rfdetr_pretrain"
+    if IS_RFDETR_STAGE2_HOCKEY
+    else
     "s3://hudl-experiments-v1/finlay/motip_crossing_finetune_s1/checkpoints/motip-hockey-crossing-finetune-s1-2026-08-02-08-58-41"
     if IS_CROSSING_FINETUNE_S1_RESUME
     else
@@ -293,15 +367,22 @@ TRAIN_DATA_SOURCE = (
     else DATA_BUCKET_PREFIX if IS_AMF_STAD_STAGE3  # same STAD data as stage 2
     else DATA_BUCKET_PREFIX if IS_AMF_STAD_STAGE3B  # same STAD data
     else DATA_BUCKET_PREFIX if IS_AMF_STAD_STAGE3B_CONTINUE  # same STAD data
+    else DATA_BUCKET_PREFIX if IS_STAD_ABLATION  # STAD v2 at channel root, no sub_dir wrapper
     else f"{DATA_BUCKET_PREFIX}/motip_hockey_data" if IS_REAL
+    else DATA_BUCKET_PREFIX if IS_RFDETR_CROSSING_FINETUNE  # crossing data layout
+    else DATA_BUCKET_PREFIX if IS_RFDETR_STAGE2_HOCKEY_RESUME  # same data layout as original
+    else DATA_BUCKET_PREFIX if IS_RFDETR_STAGE2_HOCKEY  # hockey stage-2 data root has Hockey/ subdir
+    else DATA_BUCKET_PREFIX if IS_RFDETR_STAGE1_HOCKEY  # channel root IS the data dir
+    else f"{DATA_BUCKET_PREFIX}/motip_hockey_data" if IS_RFDETR_STAGE1_REAL
+    else f"{DATA_BUCKET_PREFIX}/motip_hockey_data" if IS_RFDETR_NATIVE_STAGE1
     else f"{DATA_BUCKET_PREFIX}/data/motip_hockey_data" if not (IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2)
     else f"{DATA_BUCKET_PREFIX}/motip_hockey_data"  # mounts AMFTracking/train/ at channel root
 )
 
-input_data_config = [
-    InputData(channel_name="train", data_source=TRAIN_DATA_SOURCE),
-    InputData(channel_name="pretrain", data_source=PRETRAIN_PREFIX),
-]
+input_data_config = [InputData(channel_name="train", data_source=TRAIN_DATA_SOURCE)]
+if not (IS_RFDETR_STAGE1_HOCKEY or IS_RFDETR_STAGE1_REAL or IS_RFDETR_NATIVE_STAGE1) or IS_RFDETR_STAGE2_HOCKEY or IS_RFDETR_STAGE2_HOCKEY_RESUME or IS_RFDETR_CROSSING_FINETUNE:
+    # RF-DETR loads DINOv2 backbone from HuggingFace; no S3 pretrain channel needed
+    input_data_config.append(InputData(channel_name="pretrain", data_source=PRETRAIN_PREFIX))
 
 print("\nSubmitting job...")
 model_trainer.train(input_data_config=input_data_config, wait=False)

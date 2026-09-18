@@ -299,8 +299,16 @@ class MultiColorJitter:
             images = self.color_jitter(images)
         elif isinstance(images, list):
             assert isinstance(images[0], Image.Image)
-            params = self.color_jitter.make_params([images[0]])
-            images = [self.color_jitter.transform(_, params=params) for _ in images]
+            # Use the same random seed for all frames so jitter is consistent
+            # across the sequence. Avoids private torchvision version-specific APIs.
+            import random as _rnd
+            seed = _rnd.randint(0, 2**32 - 1)
+            result = []
+            for img in images:
+                torch.manual_seed(seed)
+                _rnd.seed(seed)
+                result.append(self.color_jitter(img))
+            images = result
         else:
             raise NotImplementedError(f"The input image type {type(images)} is not supported.")
         return images, annotations, metas
@@ -311,8 +319,14 @@ class MultiRandomPhotometricDistort:
         self.ramdom_photometric_distort = v2.RandomPhotometricDistort()
 
     def __call__(self, images, annotations, metas):
-        _params = self.ramdom_photometric_distort.make_params([images[0]])
-        images = [self.ramdom_photometric_distort.transform(_, _params) for _ in images]
+        import random as _rnd
+        seed = _rnd.randint(0, 2**32 - 1)
+        result = []
+        for img in images:
+            torch.manual_seed(seed)
+            _rnd.seed(seed)
+            result.append(self.ramdom_photometric_distort(img))
+        images = result
         return images, annotations, metas
 
 

@@ -90,7 +90,11 @@ def load_detr_pretrain(model: nn.Module, pretrain_path: str, num_classes: int | 
     detr_state_dict = dict()
     model_state_dict = model.state_dict()
     for k, v in pretrain_state_dict.items():
-        detr_state_dict["detr."+k] = v      # add the prefix for the detr model (in MOTIP).
+        # Prefer detr.base.k (RF-DETR wrapper stores LWDETR as self.base);
+        # fall back to detr.k for D-DETR which stores directly under self.detr.
+        base_key = "detr.base." + k
+        plain_key = "detr." + k
+        detr_state_dict[base_key if base_key in model_state_dict else plain_key] = v
 
     for k, v in detr_state_dict.items():
         if "class_embed" in k:
@@ -108,6 +112,14 @@ def load_detr_pretrain(model: nn.Module, pretrain_path: str, num_classes: int | 
                     raise NotImplementedError(f"Do not support detr pretrain loading for num_classes={num_classes}")
             elif num_classes == len(detr_state_dict[k]):    # Just fine for the classifier:
                 pass
+            elif k in model_state_dict and model_state_dict[k].shape == detr_state_dict[k].shape:
+                # Shape already matches (e.g. RF-DETR stores num_classes+1 internally).
+                pass
+            elif k in model_state_dict and model_state_dict[k].shape != detr_state_dict[k].shape:
+                # Class head size mismatch -- skip it, use model init weights.
+                detr_state_dict[k] = model_state_dict[k]
+            elif k not in model_state_dict:
+                pass  # extra group_detr groups not present in this model
             else:
                 raise NotImplementedError(f"Pretrained detr has a class head for {len(detr_state_dict[k])} classes, "
                                           f"we do not support this pretrained model.")
@@ -131,9 +143,24 @@ def load_detr_pretrain(model: nn.Module, pretrain_path: str, num_classes: int | 
                     pass
 
     # Transfer the pre-trained parameters to the model state dict.
+    skipped_keys = []
     for k, v in detr_state_dict.items():
-        assert k in model_state_dict, f"DETR parameter key '{k}' should in the model."
+        if k not in model_state_dict:
+            skipped_keys.append(k)
+            continue
+        if model_state_dict[k].shape != v.shape:
+            # Shape mismatch (e.g. refpoint_embed/query_feat are 13x wider
+            # in a group_detr=13 checkpoint than in a group_detr=1 model).
+            # Truncate/pad along dim 0 to match the model shape.
+            tgt_shape = model_state_dict[k].shape
+            if v.shape[1:] == tgt_shape[1:] and v.shape[0] >= tgt_shape[0]:
+                v = v[:tgt_shape[0]]
+            else:
+                skipped_keys.append(k)
+                continue
         model_state_dict[k] = v
+    if skipped_keys:
+        print(f"[WARNING] load_detr_pretrain: skipping {len(skipped_keys)} keys not in MOTIP model: {skipped_keys}")
     # Load the model state dict.
     model.load_state_dict(state_dict=model_state_dict, strict=True)
     return
@@ -158,7 +185,12 @@ def load_checkpoint(model, path, states=None, optimizer=None, scheduler=None):
     load_state = torch.load(path, map_location=lambda storage, loc: storage, weights_only=False)
     model_state = load_state["model"]
 
+    # D-DETR COCO pretrain checkpoint (has bbox_embed keys)
     if "bbox_embed.0.layers.0.weight" in model_state:
+        load_detr_pretrain(model=model, pretrain_path=path, num_classes=None)
+        return
+    # Stage-1 only_detr checkpoint saved without "detr." prefix (any framework)
+    elif not any(k.startswith("detr.") for k in model_state):
         load_detr_pretrain(model=model, pretrain_path=path, num_classes=None)
         return
     else:

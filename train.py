@@ -6,9 +6,10 @@ import torch
 import einops
 from accelerate import Accelerator
 from accelerate.state import PartialState
+from accelerate.utils import DistributedDataParallelKwargs
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim.lr_scheduler import MultiStepLR, LambdaLR
 from collections import defaultdict
 from torchvision.transforms import v2
 from typing import Any, Generator, List
@@ -36,7 +37,9 @@ def train_engine(config: dict):
         else os.path.join("./outputs/", config["EXP_NAME"])
 
     # Init Accelerator at beginning:
-    accelerator = Accelerator()
+    # RF-DETR has params unused in some forward passes (windowed attn); DDP requires find_unused_parameters=True
+    _ddp_kwargs = [DistributedDataParallelKwargs(find_unused_parameters=True)] if config.get("DETR_FRAMEWORK") == "rf_detr" else []
+    accelerator = Accelerator(kwargs_handlers=_ddp_kwargs)
     state = PartialState()
     # Also, we set the seed:
     set_seed(config["SEED"])
@@ -122,11 +125,27 @@ def train_engine(config: dict):
         lr=config["LR"],
         weight_decay=config["WEIGHT_DECAY"],
     )
-    scheduler = MultiStepLR(
-        optimizer=optimizer,
-        milestones=config["SCHEDULER_MILESTONES"],
-        gamma=config["SCHEDULER_GAMMA"],
-    )
+    lr_scheduler_type = config.get("LR_SCHEDULER", "multistep")
+    if lr_scheduler_type == "cosine":
+        _warmup_epochs = config["LR_WARMUP_EPOCHS"]
+        _total_epochs = config["EPOCHS"]
+        _min_lr_ratio = config.get("LR_MIN_RATIO", 0.01)
+
+        def _cosine_lambda(n):
+            epoch_for = n + 1
+            if epoch_for <= _warmup_epochs:
+                return 1.0
+            progress = (epoch_for - _warmup_epochs) / max(1, _total_epochs - _warmup_epochs)
+            progress = min(progress, 1.0)
+            return _min_lr_ratio + (1.0 - _min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = LambdaLR(optimizer=optimizer, lr_lambda=_cosine_lambda)
+    else:
+        scheduler = MultiStepLR(
+            optimizer=optimizer,
+            milestones=config["SCHEDULER_MILESTONES"],
+            gamma=config["SCHEDULER_GAMMA"],
+        )
 
     # Other infos:
     only_detr = config["ONLY_DETR"]
@@ -545,6 +564,29 @@ def train_one_epoch(
     return metrics
 
 
+def _rfdetr_dinov2_lr_decay(name, lr_decay_rate, num_layers):
+    # Per-layer LR decay for DINOv2 (mirrors RF-DETR get_dinov2_lr_decay_rate).
+    # MOTIP wraps RF-DETR so backbone params are named "detr.backbone.0.encoder.encoder.layer.N...."
+    layer_id = num_layers + 1  # non-backbone: decay^0 = 1.0
+    if "detr.backbone.0.encoder" in name:
+        if "embeddings" in name:
+            layer_id = 0
+        elif ".layer." in name:
+            try:
+                after = name[name.find(".layer."):]
+                layer_id = int(after.split(".")[2]) + 1
+            except (ValueError, IndexError):
+                pass
+    return lr_decay_rate ** (num_layers + 1 - layer_id)
+
+
+def _rfdetr_dinov2_wd(name, base_wd):
+    # Zero WD for norms/biases/embeddings (mirrors RF-DETR get_dinov2_weight_decay_rate).
+    if any(k in name for k in ("gamma", "pos_embed", "rel_pos", "bias", "norm", "embeddings")):
+        return 0.0
+    return base_wd
+
+
 def get_param_groups(model, config) -> list[dict]:
     def _match_names(_name, _key_names):
         for _k in _key_names:
@@ -552,7 +594,67 @@ def get_param_groups(model, config) -> list[dict]:
                 return True
         return False
 
-    # Keywords:
+    # RF-DETR: per-layer ViT LR decay matching RF-DETR's own get_param_dict.
+    # Gated on DETR_FRAMEWORK so D-DETR training is unaffected.
+    if config.get("DETR_FRAMEWORK") == "rf_detr":
+        base_lr = config["LR"]
+        # lr_encoder defaults to 1.5x base (RF-DETR default ratio: 1.5e-4 / 1e-4)
+        lr_encoder = config.get("LR_ENCODER", base_lr * 1.5)
+        lr_vit_layer_decay = config.get("LR_VIT_LAYER_DECAY", 0.8)
+        lr_component_decay = config.get("LR_COMPONENT_DECAY", 1.0)
+        weight_decay = config["WEIGHT_DECAY"]
+        # num_layers = out_feature_indexes[-1] + 1; [3,6,9,12] -> 13
+        num_layers = config.get("RFDETR_OUT_FEATURE_INDEXES", [3, 6, 9, 12])[-1] + 1
+
+        backbone_enc_key = "detr.backbone.0.encoder"
+        decoder_key = "detr.transformer.decoder"
+        linear_proj_names = config["LR_LINEAR_PROJ_NAMES"]
+        linear_proj_scale = config["LR_LINEAR_PROJ_SCALE"]
+        dictionary_names = config["LR_DICTIONARY_NAMES"]
+        dictionary_scale = config["LR_DICTIONARY_SCALE"]
+
+        backbone_set, decoder_set, linproj_set, dict_set = set(), set(), set(), set()
+        param_groups = []
+
+        # 1. Backbone encoder: per-layer decay; lr_scale set so lr_warmup scales correctly
+        for n, p in model.named_parameters():
+            if backbone_enc_key in n and p.requires_grad:
+                layer_decay = _rfdetr_dinov2_lr_decay(n, lr_vit_layer_decay, num_layers)
+                lr = lr_encoder * layer_decay * (lr_component_decay ** 2)
+                lr_scale = lr / base_lr
+                wd = _rfdetr_dinov2_wd(n, weight_decay)
+                param_groups.append({"params": p, "lr": lr, "lr_scale": lr_scale, "weight_decay": wd})
+                backbone_set.add(n)
+
+        # 2. Decoder: full LR * component_decay
+        for n, p in model.named_parameters():
+            if decoder_key in n and p.requires_grad:
+                lr = base_lr * lr_component_decay
+                lr_scale = lr_component_decay
+                param_groups.append({"params": p, "lr": lr, "lr_scale": lr_scale})
+                decoder_set.add(n)
+
+        # 3. Linear proj params (sampling offsets, reference points, etc.)
+        for n, p in model.named_parameters():
+            if _match_names(n, linear_proj_names) and n not in backbone_set and n not in decoder_set and p.requires_grad:
+                param_groups.append({"params": p, "lr": base_lr * linear_proj_scale, "lr_scale": linear_proj_scale})
+                linproj_set.add(n)
+
+        # 4. Dictionary params
+        for n, p in model.named_parameters():
+            if _match_names(n, dictionary_names) and n not in backbone_set and n not in decoder_set and n not in linproj_set and p.requires_grad:
+                param_groups.append({"params": p, "lr": base_lr * dictionary_scale, "lr_scale": dictionary_scale})
+                dict_set.add(n)
+
+        # 5. Remaining params: full base LR
+        all_special = backbone_set | decoder_set | linproj_set | dict_set
+        for n, p in model.named_parameters():
+            if n not in all_special and p.requires_grad:
+                param_groups.append({"params": p, "lr": base_lr})
+
+        return param_groups
+
+    # Default (D-DETR / non-RF-DETR): original flat backbone scale logic
     backbone_names = config["LR_BACKBONE_NAMES"]
     linear_proj_names = config["LR_LINEAR_PROJ_NAMES"]
     dictionary_names = config["LR_DICTIONARY_NAMES"]

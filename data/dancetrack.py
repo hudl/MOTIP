@@ -32,7 +32,8 @@ class DanceTrack(OneDataset):
         return
 
     def _get_sequence_names(self):
-        return os.listdir(os.path.join(self.data_dir, self.split))
+        base = os.path.join(self.data_dir, self.split)
+        return [e for e in os.listdir(base) if os.path.isdir(os.path.join(base, e))]
 
     def _get_sequence_infos(self):
         sequence_names = self._get_sequence_names()
@@ -41,6 +42,8 @@ class DanceTrack(OneDataset):
             sequence_dir = self._get_sequence_dir(self.data_dir, self.split, sequence_name)
             ini = ConfigParser()
             ini.read(os.path.join(sequence_dir, "seqinfo.ini"))
+            if "Sequence" not in ini:
+                continue
             sequence_infos[sequence_name] = {
                 "width": int(ini["Sequence"]["imWidth"]),
                 "height": int(ini["Sequence"]["imHeight"]),

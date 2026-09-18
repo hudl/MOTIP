@@ -1,0 +1,21 @@
+SUPER_CONFIG_PATH: ./configs/pretrain_r50_deformable_detr_sportsmot.yaml
+
+EXP_NAME: stad_detr_pretrain_ablation
+
+# Use STAD v2 tracking data but detection-only training (no ID decoder).
+# Ablation to isolate data vs training strategy effect vs stage1 (AMF detection data).
+DATASETS: [STADTracking]
+DATASET_SPLITS: [train]
+
+INFERENCE_DATASET:
+
+# Match stage1 hyperparams exactly so only the data changes.
+EPOCHS: 20
+LR: 1.0e-4
+LR_WARMUP_EPOCHS: 0
+SCHEDULER_MILESTONES: [15, ]
+SCHEDULER_GAMMA: 0.1
+BATCH_SIZE: 2
+ACCUMULATE_STEPS: 1
+
+SAVE_CHECKPOINT_PER_EPOCH: 1

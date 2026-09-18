@@ -1,0 +1,11 @@
+# RF-DETR MOTIP stage-2 smoketest — 2 epochs, 3 sequences.
+SUPER_CONFIG_PATH: ./configs/rfdetr_motip_hockey_stage2.yaml
+
+EPOCHS: 2
+BATCH_SIZE: 1
+ACCUMULATE_STEPS: 1
+LR_WARMUP_EPOCHS: 0
+SAVE_CHECKPOINT_PER_EPOCH: 1
+SAMPLE_LENGTHS: [8, ]
+
+EXP_NAME: rfdetr-motip-hockey-stage2-smoke

@@ -1,0 +1,2 @@
+SUPER_CONFIG_PATH: ./configs/rfdetr_motip_hockey_stage2.yaml
+DETR_PRETRAIN:

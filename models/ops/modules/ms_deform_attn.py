@@ -127,9 +127,13 @@ class MSDeformAttn(nn.Module):
         # for BF16:
         if value.dtype == torch.bfloat16:
             # for mixed precision
+            # attention_weights needs the same fp32 cast as value/sampling_locations:
+            # the compiled kernel is fp32-only and rejects a mixed-dtype call with
+            # "expected scalar type Float but found BFloat16".
             output = MSDeformAttnFunction.apply(
                 value.to(torch.float32), input_spatial_shapes, input_level_start_index,
-                sampling_locations.to(torch.float32), attention_weights, self.im2col_step)
+                sampling_locations.to(torch.float32), attention_weights.to(torch.float32),
+                self.im2col_step)
             output = output.to(torch.bfloat16)
             output = self.output_proj(output)
             return output

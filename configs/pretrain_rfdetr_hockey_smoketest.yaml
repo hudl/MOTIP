@@ -1,0 +1,28 @@
+# RF-DETR stage-1 smoke test: DETR-only pretrain in MOTIP.
+# Same pattern as pretrain_r50_deformable_detr_hockey_smoketest.yaml.
+#
+# Set DETR_PRETRAIN to an RF-DETR COCO checkpoint if you have one, or leave
+# blank to start from DINOv2 initialisation only.  DINOv2 weights load
+# automatically from HuggingFace — requires transformers>=4.46,<5.0 installed.
+#
+# Output checkpoint goes into OUTPUTS_DIR; point the stage-2 config's
+# DETR_PRETRAIN at the best epoch before running rfdetr_motip_hockey_smoketest.yaml.
+
+SUPER_CONFIG_PATH: ./configs/rfdetr_motip_hockey_smoketest.yaml
+
+SAMPLE_LENGTHS: [1, ]          # single-frame detection only
+DETR_PRETRAIN:                  # optional: RF-DETR COCO checkpoint path
+DETR_NUM_TRAIN_FRAMES: 100      # >> batch size, same as D-DETR pretrain
+
+ONLY_DETR: True
+
+# Training strategies — match D-DETR pretrain
+EPOCHS: 20
+LR: 1.0e-4
+LR_WARMUP_EPOCHS: 0
+SCHEDULER_MILESTONES: [15, ]
+SCHEDULER_GAMMA: 0.1
+BATCH_SIZE: 2
+ACCUMULATE_STEPS: 1
+
+SAVE_CHECKPOINT_PER_EPOCH: 5

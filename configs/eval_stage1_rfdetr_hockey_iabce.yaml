@@ -1,0 +1,8 @@
+SUPER_CONFIG_PATH: ./configs/eval_stage1_rfdetr_hockey.yaml
+
+# IA-BCE loss (used in RF-DETR training) produces scores in the 0.50-0.78 range
+# rather than the 0.6-0.9 range focal loss produces. newborn_thresh=0.6 blocks
+# ~40% of valid detections from starting tracks. Set both thresholds to 0.5
+# so every detection that passes the filter can also start a new track.
+DET_THRESH: 0.5
+NEWBORN_THRESH: 0.5

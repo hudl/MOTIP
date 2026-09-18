@@ -1,0 +1,11 @@
+SUPER_CONFIG_PATH: ./configs/eval_stage1_rfdetr_hockey_iabce.yaml
+ONLY_DETR: False
+RFDETR_GROUP_DETR: 1
+
+# --- inference performance ---
+# FP16 model weights give 3.7x speedup on T4 (12fps vs 3.4fps at 800px).
+# Training resolution is 576; using it for inference matches distribution
+# and gives ~28fps FP16 vs ~12fps at 800px. motip_inprocess.py calls
+# model.half() when this is FP16.
+INFERENCE_DTYPE: FP16
+INFERENCE_MAX_SHORTER: 576
