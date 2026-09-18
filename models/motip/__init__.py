@@ -5,7 +5,6 @@ import os
 
 from .motip import MOTIP
 from structures.args import Args
-from models.deformable_detr.deformable_detr import build as build_deformable_detr
 from models.motip.trajectory_modeling import TrajectoryModeling
 from models.motip.id_decoder import IDDecoder
 
@@ -256,6 +255,7 @@ def build(config: dict):
     detr_framework = config["DETR_FRAMEWORK"].lower()
     match detr_framework:
         case "deformable_detr":
+            from models.deformable_detr.deformable_detr import build as build_deformable_detr
             detr, detr_criterion, _ = build_deformable_detr(args=detr_args)
         case "rf_detr":
             detr, detr_criterion = _build_rf_detr(config, detr_args)

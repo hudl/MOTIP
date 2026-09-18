@@ -42,50 +42,7 @@ torch.nn.functional.interpolate = _no_aa
 
 
 # ── TRT helpers ───────────────────────────────────────────────────────────────
-def _load_engine(path):
-    import tensorrt as trt
-    logger = trt.Logger(trt.Logger.WARNING)
-    runtime = trt.Runtime(logger)
-    return runtime.deserialize_cuda_engine(Path(path).read_bytes())
-
-
-
-class TRTDetectorWrapper:
-    """Cached-context TRT wrapper: creates ctx and output buffers once, reuses each call."""
-    def __init__(self, engine, res=576):
-        import tensorrt as trt
-        self.res = res
-        self._ctx = engine.create_execution_context()
-        dtype_map = {getattr(trt, n): t for n, t in
-                     (("float32", torch.float32), ("float16", torch.float16),
-                      ("int32", torch.int32), ("int64", torch.int64))
-                     if hasattr(trt, n)}
-        self._tensors = {}
-        for i in range(engine.num_io_tensors):
-            name = engine.get_tensor_name(i)
-            shape = tuple(self._ctx.get_tensor_shape(name))
-            dtype = dtype_map[engine.get_tensor_dtype(name)]
-            self._tensors[name] = torch.zeros(shape, dtype=dtype, device="cuda")
-            self._ctx.set_tensor_address(name, self._tensors[name].data_ptr())
-        self._stream = torch.cuda.Stream()
-
-    def __call__(self, samples):
-        img = samples.tensors.to("cuda", dtype=torch.float32)
-        if img.shape[2] != self.res or img.shape[3] != self.res:
-            img = F.interpolate(img, size=(self.res, self.res),
-                                mode="bilinear", align_corners=False)
-        inp = self._tensors["input"]
-        inp.copy_(img.half() if inp.dtype == torch.float16 else img)
-        self._ctx.execute_async_v3(self._stream.cuda_stream)
-        self._stream.synchronize()
-        out = {k: v.float() for k, v in self._tensors.items() if k != "input"}
-        return {"pred_logits": out["logits"],
-                "pred_boxes":  out["boxes"],
-                "outputs":     out["query_embeds"]}
-
-    def eval(self): return self
-    def train(self, mode=True): return self
-    def parameters(self): return iter([])
+from trt.trt_wrapper import load_engine as _load_engine, TRTDetectorWrapper
 
 
 # ── NestedTensor (real MOTIP class, has .decompose()) ────────────────────────

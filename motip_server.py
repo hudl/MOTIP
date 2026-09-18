@@ -43,9 +43,42 @@ from utils.nested_tensor import nested_tensor_from_tensor_list
 
 
 def load_model(config_path: str, checkpoint_path: str):
-    """Load MOTIP model and return (model, config, accelerator)."""
+    """Load MOTIP model and return (model, config, accelerator).
+
+    If MOTIP_TRT_ENGINE is set, the RF-DETR detector is replaced with a
+    TensorRT engine; only the trajectory/ID decoder weights are loaded from
+    the checkpoint.  The returned accelerator is None in that case (the TRT
+    wrapper has no PyTorch parameters to prepare).
+    """
     cfg = yaml_to_dict(config_path)
     cfg = load_super_config(cfg, cfg.get("SUPER_CONFIG_PATH"))
+
+    trt_engine_path = os.environ.get("MOTIP_TRT_ENGINE", "")
+    if trt_engine_path:
+        sys.path.insert(0, os.path.join(MOTIP_ROOT, "trt"))
+        from trt_wrapper import load_engine, TRTDetectorWrapper
+
+        model, _ = build_motip(config=cfg)
+        # Load only non-detector weights (trajectory_modeling + id_decoder).
+        ck = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        raw = ck.get("model", ck.get("state_dict", ck))
+        model_sd = model.state_dict()
+        filtered = {
+            k: v for k, v in raw.items()
+            if not k.startswith("detr.base.")
+            and k in model_sd
+            and model_sd[k].shape == v.shape
+        }
+        model.load_state_dict(filtered, strict=False)
+        model.cuda().eval()
+
+        engine = load_engine(trt_engine_path)
+        trt_res = int(os.environ.get("MOTIP_TRT_RES", "576"))
+        object.__setattr__(model, "detr", TRTDetectorWrapper(engine, res=trt_res))
+        sys.stderr.write(
+            f"MOTIP server: TRT engine loaded from {trt_engine_path} (res={trt_res})\n"
+        )
+        return model, cfg, None
 
     accelerator = Accelerator()
     model, _ = build_motip(config=cfg)

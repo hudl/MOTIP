@@ -72,7 +72,7 @@ def _build_trt(engine_path, ckpt, num_classes=3):
             if not k.startswith("detr.base.") and k in msd and msd[k].shape==v.shape}
     m.load_state_dict(filt, strict=False)
     # replace detr with TRT wrapper
-    from compare_pt_trt import TRTDetectorWrapper, _load_engine
+    from trt.trt_wrapper import load_engine as _load_engine, TRTDetectorWrapper
     engine = _load_engine(engine_path)
     object.__setattr__(m, "detr", TRTDetectorWrapper(engine, res=576))
     return m, cfg
