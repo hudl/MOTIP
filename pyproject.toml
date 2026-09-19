@@ -10,3 +10,6 @@ dependencies = ["rfdetr>=1.3.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["models", "data", "utils", "configs", "log", "structures"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"motip_server.py" = "motip_server.py"
