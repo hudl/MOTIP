@@ -20,6 +20,7 @@ class NaiveSampler(Sampler):
             seed: int = 1025,
             data_weights: dict | None = None,
             sample_stride: int = 1,
+            short_sequence_mode: str = "drop",
     ):
         super().__init__()
         self.data_source = data_source
@@ -31,6 +32,11 @@ class NaiveSampler(Sampler):
         self.seed = seed
         self.data_weights = data_weights
         self.sample_stride = sample_stride
+        # Sequences shorter than sample_length: "drop" (original MOTIP behaviour) or "whole"
+        # (one sample covering the whole sequence; T then varies per step, so requires BATCH_SIZE 1).
+        assert short_sequence_mode in ("drop", "whole"), f"Unknown short_sequence_mode '{short_sequence_mode}'."
+        self.short_sequence_mode = short_sequence_mode
+        self.last_epoch_stats = None
         # Check for these parameters:
         assert len(sample_steps) == len(sample_lengths) == len(sample_intervals), \
             "The lengths of sample_steps, sample_lengths, and sample_intervals should be the same."
@@ -57,6 +63,7 @@ class NaiveSampler(Sampler):
         random.seed(self.seed + epoch)      # only for sampling process.
         ############################################################
         sample_infos = []
+        _stats = {"sequences": 0, "short": 0, "short_kept": 0, "no_window": 0}
         sample_length: int | None = None
         sample_interval: int | None = None
         # First, calculate the sample length and interval:
@@ -81,7 +88,21 @@ class NaiveSampler(Sampler):
                 # TODO: Add support for float weights.
                 # Sampling:
                 for sequence_name in self.data_source.annotations[dataset][split]:
-                    for frame_id in range(self.data_source.sequence_infos[dataset][split][sequence_name]["length"]):
+                    _seq_len = self.data_source.sequence_infos[dataset][split][sequence_name]["length"]
+                    _n_before = len(sample_infos)
+                    _is_short = (_seq_len < sample_length
+                                 and self.data_source.sequence_infos[dataset][split][sequence_name]["is_static"] is False)
+                    _stats["sequences"] += 1
+                    _stats["short"] += _is_short
+                    if _is_short and self.short_sequence_mode == "whole":
+                        _idxs = list(range(_seq_len))
+                        if self.data_source.ann_is_legals[dataset][split][sequence_name][torch.tensor(_idxs)].all():
+                            for _ in range(_weight):
+                                sample_infos.append({"dataset": dataset, "split": split,
+                                                     "sequence": sequence_name, "frame_idxs": _idxs})
+                            _stats["short_kept"] += 1
+                        continue
+                    for frame_id in range(_seq_len):
                         _sample_times = _weight
                         for _ in range(_sample_times):
                             if self.data_source.sequence_infos[dataset][split][sequence_name]["is_static"] is True:
@@ -114,10 +135,16 @@ class NaiveSampler(Sampler):
                                             "sequence": sequence_name,
                                             "frame_idxs": frame_idxs,
                                         })
-        # Apply stride to subsample valid starts (reduces steps/epoch without changing clip length).
-        if self.sample_stride > 1:
-            sample_infos = sample_infos[::self.sample_stride]
+                    # Stride per sequence (not over the global list) so every sequence with a valid
+                    # window keeps at least one: [::stride] always includes the first start.
+                    _seq_samples = sample_infos[_n_before:]
+                    _stats["no_window"] += (len(_seq_samples) == 0) and not _is_short
+                    if self.sample_stride > 1:
+                        del sample_infos[_n_before:]
+                        sample_infos += _seq_samples[::self.sample_stride]
+        # (SAMPLE_STRIDE is applied per sequence above.)
         total_len = len(sample_infos)
+        self.last_epoch_stats = dict(_stats, samples=total_len, sample_length=sample_length)
         # Shuffle the samples
         # and only keep the first "total_len // (sample_length / self.length_per_iteration)" samples:
         if self.length_per_iteration is None:

@@ -1,6 +1,8 @@
 # Copyright (c) Ruopeng Gao. All Rights Reserved.
 
 import os
+import re
+import sys
 import json
 import argparse
 import yaml
@@ -78,13 +80,53 @@ class Logger:
                 )   # for more details, see https://docs.wandb.ai/ref/python/init
             else:
                 self.wandb = None
+            # MLflow: activate when MLFLOW_TRACKING_URI is set in the environment
+            # (injected automatically by SageMaker training jobs via the AMLOps pattern).
+            mlflow_uri = os.environ.get("MLFLOW_TRACKING_URI")
+            if mlflow_uri:
+                import mlflow
+                mlflow.set_tracking_uri(mlflow_uri)
+                experiment_name = os.environ.get("MLFLOW_EXPERIMENT_NAME", exp_project or "MOTIP")
+                mlflow.set_experiment(experiment_name)
+                run_name = os.environ.get("MLFLOW_RUN_NAME", exp_name)
+                self.mlflow_run = mlflow.start_run(run_name=run_name)
+                if config is not None:
+                    mlflow.log_params({k: str(v)[:500] for k, v in config.items()})
+                if os.environ.get("MOTIP_CHECKPOINT_S3"):
+                    mlflow.set_tag("checkpoint_s3", os.environ["MOTIP_CHECKPOINT_S3"])
+                # Mark the run FAILED (instead of mlflow's atexit FINISHED) if training crashes:
+                _prev_excepthook = sys.excepthook
+
+                def _mlflow_excepthook(exc_type, exc_value, exc_tb):
+                    self.finish(status="FAILED")
+                    _prev_excepthook(exc_type, exc_value, exc_tb)
+                sys.excepthook = _mlflow_excepthook
+            else:
+                self.mlflow_run = None
         else:
             self.wandb = None
+            self.mlflow_run = None
         return
 
     def config(self, config: dict):
         self._print_config(config=config)
         self._save_config(config=config, filename="config.yaml")
+        if self.mlflow_run and is_main_process():
+            import mlflow
+            mlflow.log_artifact(os.path.join(self.logdir, "config.yaml"))
+        return
+
+    def set_tags(self, tags: dict):
+        if self.mlflow_run and is_main_process():
+            import mlflow
+            mlflow.set_tags({k: str(v) for k, v in tags.items()})
+        return
+
+    def finish(self, status: str = "FINISHED"):
+        if self.mlflow_run and is_main_process():
+            import mlflow
+            mlflow.end_run(status=status)
+            self.mlflow_run = None
         return
 
     def dataset(self, dataset: JointDataset):
@@ -232,6 +274,9 @@ class Logger:
                         data={x_axis_name: x_axis_step},
                         step=global_step
                     )
+            if self.mlflow_run:
+                self.save_metrics_to_mlflow(metrics=metrics, statistic=statistic,
+                                            global_step=global_step, prefix=prefix)
         return
 
     def _write_dict_to_yaml(self, x: dict, filename: str, mode: str = "w"):
@@ -286,6 +331,18 @@ class Logger:
             metric_value = value.__getattribute__(statistic)
             self.wandb_log(data={metric_name: metric_value}, step=global_step)
         pass
+
+    def save_metrics_to_mlflow(self, metrics: Metrics, statistic: str = "average",
+                               global_step: int = 0, prefix: None | str = None):
+        if self.mlflow_run and is_main_process():
+            import mlflow
+            batch = {}
+            for name, value in metrics.metrics.items():
+                metric_name = f"{prefix}_{name}" if prefix is not None else name
+                # MLflow rejects names outside [\w\-. :/], e.g. "max_cuda_mem(MB)".
+                metric_name = re.sub(r"[^\w\-. :/]", "_", metric_name)
+                batch[metric_name] = value.__getattribute__(statistic)
+            mlflow.log_metrics(batch, step=global_step)
 
 
 def parser_to_dict(log: argparse.ArgumentParser) -> dict:

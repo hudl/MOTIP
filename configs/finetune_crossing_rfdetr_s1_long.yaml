@@ -1,0 +1,71 @@
+SUPER_CONFIG_PATH: ./configs/rfdetr_motip_hockey_stage2.yaml
+
+# Dataset: crossing-focused sequences, s1_long (stride 1, merged +-100-frame windows, native fps; train = tracking_train, val = tracking_50).
+DATA_ROOT: /mnt/s3files/faceoff/tracking_workgroup/tracking_experiments/motip_crossing_dataset_s1_long
+DATASETS: [Hockey]
+DATASET_SPLITS: [train]
+
+NUM_CLASSES: 3
+
+# Resuming from the v1 RF-DETR crossing fine-tune checkpoint_12 (production model; passed via --resume-model).
+DETR_PRETRAIN:
+RESUME_MODEL:
+RESUME_OPTIMIZER: False
+RESUME_SCHEDULER: False
+RESUME_STATES: False
+
+# Frozen RF-DETR: only the trajectory FFN + ID decoder train. The detector runs in eval mode under
+# no_grad and only its last-layer Hungarian matching is computed (no DETR losses).
+DETR_FREEZE: True
+# fp32 on purpose: vs fp32, bf16 query embeddings drift (mean cos 0.86-0.94, 6-8% of GT matches move
+# to a different query), fp16 less so (cos 0.96-0.99, ~0.4%). Inference is FP32, so train on FP32 features.
+DETR_FROZEN_AUTOCAST: none
+
+# Short fine-tune, lower LR to avoid catastrophic forgetting
+EPOCHS: 13
+LR: 2.0e-5
+LR_WARMUP_EPOCHS: 0
+SCHEDULER_MILESTONES: [10, 12]
+SCHEDULER_GAMMA: 0.1
+
+# s1_long sequences: merged crossing windows at native fps (stride 1), ~150-300 frames. 120-frame windows
+# (4 s @ 30 fps) to train ID holding over longer gaps than stage 2's 60. REL_PE_LENGTH is extended to match:
+# the stage-2 checkpoint's 60 learned gap biases are kept, gaps 60-119 start as a copy of gap 59
+# (models/misc.py resize_rel_pos_embeds). Interval max 4, clamped by the sampler to fit each sequence.
+# SAMPLE_STRIDE 48: ~1.8k samples/epoch (~1.5-2 h on 4x A10G) so 13 epochs + val fit in the 36 h job limit.
+SAMPLE_INTERVALS: [4]
+SAMPLE_LENGTHS: [120]
+SAMPLE_STRIDE: 48
+REL_PE_LENGTH: 120
+
+# Sequences shorter than the window (crossings near a clip edge) become one whole-sequence sample
+# instead of being dropped. Needs BATCH_SIZE 1.
+SAMPLE_SHORT_SEQUENCES: whole
+
+SAVE_CHECKPOINT_PER_EPOCH: 1
+
+# Disable colour jitter and trajectory augmentations (same as D-DETR crossing finetune)
+AUG_BRIGHTNESS: 0.0
+AUG_CONTRAST: 0.0
+AUG_SATURATION: 0.0
+AUG_HUE: 0.0
+AUG_TRAJECTORY_OCCLUSION_PROB: 0.0
+AUG_TRAJECTORY_SWITCH_PROB: 0.0
+
+# Validation on tracking_50-derived crossing sequences; checkpoint_best.pth tracks val HOTA.
+INFERENCE_DATASET: Hockey
+INFERENCE_SPLIT: val
+INFERENCE_MODE: evaluate
+EVAL_PER_EPOCH: 1
+EVAL_BEFORE_TRAIN: True
+# Deterministic, evenly strided subset of the sorted val sequences (the same 150 every epoch), so a
+# val pass stays well under an epoch. Final comparison is the full tracking_50 eval.
+INFERENCE_MAX_SEQS: 150
+
+# Val-time tracker memory; can now match REL_PE_LENGTH.
+MISS_TOLERANCE: 120
+DET_THRESH: 0.3
+NEWBORN_THRESH: 0.6
+
+EXP_NAME: rfdetr_crossing_finetune_s1_long
+USE_WANDB: False

@@ -57,6 +57,8 @@ ENTRYPOINTS = {
     "rfdetr-stage2-hockey": "motip_sm_entrypoint_rfdetr_stage2_hockey.sh",
     "rfdetr-stage2-hockey-resume": "motip_sm_entrypoint_rfdetr_stage2_hockey_resume.sh",
     "rfdetr-crossing-finetune": "motip_sm_entrypoint_rfdetr_crossing_finetune.sh",
+    "rfdetr-crossing-finetune-s2": "motip_sm_entrypoint_rfdetr_crossing_finetune_s2.sh",
+    "rfdetr-crossing-finetune-s1-long": "motip_sm_entrypoint_rfdetr_crossing_finetune_s1_long.sh",
     "stage1-stad-ablation": "motip_sm_entrypoint_stage1_stad_ablation.sh",
 }
 ENTRYPOINT = ENTRYPOINTS[STAGE]
@@ -79,7 +81,10 @@ IS_RFDETR_STAGE1_REAL = STAGE == "rfdetr-stage1-real"
 IS_RFDETR_NATIVE_STAGE1 = STAGE == "rfdetr-native-stage1-real"
 IS_RFDETR_STAGE2_HOCKEY = STAGE == "rfdetr-stage2-hockey"
 IS_RFDETR_STAGE2_HOCKEY_RESUME = STAGE == "rfdetr-stage2-hockey-resume"
-IS_RFDETR_CROSSING_FINETUNE = STAGE == "rfdetr-crossing-finetune"
+IS_RFDETR_CROSSING_FINETUNE_S2 = STAGE == "rfdetr-crossing-finetune-s2"
+IS_RFDETR_CROSSING_FINETUNE_S1_LONG = STAGE == "rfdetr-crossing-finetune-s1-long"
+# s2/s1_long share the v1 crossing-finetune plumbing (pretrain channel, data layout); only data/output prefixes differ.
+IS_RFDETR_CROSSING_FINETUNE = STAGE == "rfdetr-crossing-finetune" or IS_RFDETR_CROSSING_FINETUNE_S2 or IS_RFDETR_CROSSING_FINETUNE_S1_LONG
 IS_CROSSING_FINETUNE = STAGE == "crossing-finetune"
 IS_CROSSING_FINETUNE_S1 = STAGE == "crossing-finetune-s1"
 IS_CROSSING_FINETUNE_S1_RESUME = STAGE == "crossing-finetune-s1-resume"
@@ -99,6 +104,15 @@ elif IS_CROSSING_FINETUNE_S1:
     INSTANCE_TYPE = "ml.g7e.12xlarge"
     NUM_INSTANCES = 1
     MAX_RUNTIME = 12 * 3600  # stride-1 longer sequences, ~8-10h expected
+elif IS_RFDETR_CROSSING_FINETUNE_S2 or IS_RFDETR_CROSSING_FINETUNE_S1_LONG:
+    # Frozen RF-DETR with per-epoch validation. A/B: s2 = per-event stride-2 windows,
+    # s1_long = stride-1 merged +-100-frame windows (build_crossing_dataset.py defaults).
+    _ds = "s2" if IS_RFDETR_CROSSING_FINETUNE_S2 else "s1_long"
+    DATA_BUCKET_PREFIX = f"s3://hudl-experiments-v1/faceoff/metaflow/data/tracking_workgroup/tracking_experiments/motip_crossing_dataset_{_ds}"
+    OUTPUT_BUCKET_PREFIX = f"s3://hudl-experiments-v1/finlay/motip_rfdetr_crossing_finetune_{_ds}"
+    INSTANCE_TYPE = "ml.g5.12xlarge"  # 4x A10G, same as RF-DETR stage 2 and the v1 crossing fine-tune
+    NUM_INSTANCES = 1
+    MAX_RUNTIME = 36 * 3600  # 13 epochs + 14 val passes
 elif IS_RFDETR_CROSSING_FINETUNE:
     DATA_BUCKET_PREFIX = "s3://hudl-experiments-v1/faceoff/metaflow/data/tracking_workgroup/tracking_experiments/motip_crossing_dataset"
     OUTPUT_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/motip_rfdetr_crossing_finetune_v1"
@@ -242,6 +256,11 @@ session = sagemaker.session.Session(boto3.Session(region_name="us-east-1"))
 
 timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 job_name = f"motip-hockey-{STAGE}-{timestamp}"
+# SageMaker caps job names at 63 chars and ModelTrainer appends its own suffix, truncating the result; a base
+# longer than 60 can be cut on a '-' (invalid). Drop the 'hockey-' infix for long stage names.
+if len(job_name) > 60:
+    job_name = f"motip-{STAGE}-{timestamp}"
+assert len(job_name) <= 60, f"job name too long for SageMaker: {job_name}"
 
 print(f"Retrieving SageMaker PyTorch training image for {INSTANCE_TYPE}...")
 pytorch_image_uri = sagemaker.image_uris.retrieve(
@@ -264,7 +283,7 @@ compute_config = Compute(
     instance_type=INSTANCE_TYPE,
     instance_count=NUM_INSTANCES,
     keep_alive_period_in_seconds=0,
-    volume_size_in_gb=100 if (IS_REAL or IS_RFDETR_STAGE1_REAL or IS_RFDETR_NATIVE_STAGE1 or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2 or IS_AMF_STAD_STAGE2 or IS_AMF_STAD_STAGE3 or IS_AMF_STAD_STAGE3B or IS_AMF_STAD_STAGE3B_CONTINUE or IS_STAD_ABLATION) else 50,
+    volume_size_in_gb=100 if (IS_REAL or IS_RFDETR_STAGE1_REAL or IS_RFDETR_NATIVE_STAGE1 or IS_AMF_STAGE2 or IS_AMF_STAGE2_RESUME or IS_AMF_STAGE2_RESUME2 or IS_AMF_STAD_STAGE2 or IS_AMF_STAD_STAGE3 or IS_AMF_STAD_STAGE3B or IS_AMF_STAD_STAGE3B_CONTINUE or IS_STAD_ABLATION) else 150 if (IS_RFDETR_CROSSING_FINETUNE_S2 or IS_RFDETR_CROSSING_FINETUNE_S1_LONG) else 50,
 )
 output_data_config = OutputDataConfig(s3_output_path=f"{OUTPUT_BUCKET_PREFIX}/output")
 checkpoint_config = CheckpointConfig(
@@ -306,6 +325,7 @@ model_trainer = ModelTrainer(
         ),
         "MLFLOW_WORKSPACE": "faceoff",
         "MLFLOW_RUN_NAME": job_name,
+        "MOTIP_CHECKPOINT_S3": f"{OUTPUT_BUCKET_PREFIX}/checkpoints/{job_name}",
     },
 )
 
@@ -315,6 +335,10 @@ model_trainer = ModelTrainer(
 #   stage2-amf:         our own AMF stage-1 checkpoint (checkpoint_14 is the last one)
 #   stage2-amf-resume:  stage-2 checkpoint_1.pth (epoch 1, resume full training)
 PRETRAIN_PREFIX = (
+    # s2/s1_long A/B continue from the production model: v1 crossing fine-tune checkpoint_12.
+    "s3://hudl-experiments-v1/finlay/motip_rfdetr_crossing_finetune_v1/checkpoints/motip-hockey-rfdetr-crossing-finetune-2026-09-14-13-03-48"
+    if (IS_RFDETR_CROSSING_FINETUNE_S2 or IS_RFDETR_CROSSING_FINETUNE_S1_LONG)
+    else
     "s3://hudl-experiments-v1/finlay/motip_rfdetr_stage2_hockey_v2/checkpoints/motip-hockey-rfdetr-stage2-hockey-resume-2026-09-13-11-26-49"
     if IS_RFDETR_CROSSING_FINETUNE
     else

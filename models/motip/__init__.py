@@ -189,15 +189,18 @@ def _build_rf_detr(config, detr_args):
 
         def __call__(self, outputs, targets, **kwargs):
             losses = self._c(outputs, targets)
+            return losses, self.match_last_layer(outputs, targets)
+
+        def match_last_layer(self, outputs, targets, **kwargs):
             # Re-run matcher on first 300 queries only to get 1-to-1 assignments
             # that prepare_for_motip expects (group_detr=13 gives 13*N matches).
+            # Also used alone by DETR_FREEZE training, where no DETR losses are computed.
             single = {
                 "pred_logits": outputs["pred_logits"][:, :self._num_queries, :],
                 "pred_boxes":  outputs["pred_boxes"][:, :self._num_queries, :],
             }
             with _torch.no_grad():
-                indices = self._c.matcher(single, targets)
-            return losses, indices
+                return self._c.matcher(single, targets)
 
         def train(self, mode=True):
             self._c.train(mode)

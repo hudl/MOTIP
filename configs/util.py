@@ -23,9 +23,9 @@ def update_config_with_kv(config: dict, k: str, v) -> [bool, dict]:
             if hit:
                 break
         elif config_k == k.upper():
-            if v == "True":
+            if isinstance(v, str) and v.lower() == "true":
                 config[config_k] = True
-            elif v == "False":
+            elif isinstance(v, str) and v.lower() == "false":
                 config[config_k] = False
             else:
                 config[config_k] = v
@@ -55,9 +55,9 @@ def update_config(config: dict, option: argparse.Namespace) -> dict:
             # hit, config = update_config_with_kv(config=config, k=option_k, v=option_v)
             config_k = option_k.upper()
             if config_k in config:
-                if option_v == "True":
+                if isinstance(option_v, str) and option_v.lower() == "true":
                     config[config_k] = True
-                elif option_v == "False":
+                elif isinstance(option_v, str) and option_v.lower() == "false":
                     config[config_k] = False
                 else:
                     config[config_k] = option_v

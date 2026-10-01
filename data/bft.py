@@ -7,6 +7,8 @@ from .dancetrack import DanceTrack
 
 
 class BFT(DanceTrack):
+    sequence_marker = "img1"   # BFT ships no seqinfo.ini; lengths come from img1/
+
     def __init__(
             self,
             data_root: str = "./datasets/",

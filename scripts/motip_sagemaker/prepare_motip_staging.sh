@@ -32,7 +32,7 @@ fi
 # Prune noise
 find "${STAGE}" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 find "${STAGE}" -type d -name build -path '*/ops/build' -exec rm -rf {} + 2>/dev/null || true
-find "${STAGE}" -type d -name datasets -exec rm -rf {} + 2>/dev/null || true
+find "${STAGE}" -type d -name datasets -not -path "*/TrackEval/*" -exec rm -rf {} + 2>/dev/null || true  # keep TrackEval/trackeval/datasets (needed for val)
 find "${STAGE}" -type d -name outputs -exec rm -rf {} + 2>/dev/null || true
 find "${STAGE}" -type f -name '*.pyc' -delete
 find "${STAGE}" -type f -name '*.pth' -delete

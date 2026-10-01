@@ -1,0 +1,5 @@
+# Inference for checkpoints trained with REL_PE_LENGTH 120 (e.g. rfdetr_crossing_finetune_s1_long).
+# Loading such a checkpoint with a 60-length config truncates its long-gap weights (logged by load_checkpoint).
+SUPER_CONFIG_PATH: ./configs/eval_stage2_rfdetr_hockey.yaml
+REL_PE_LENGTH: 120
+MISS_TOLERANCE: 120

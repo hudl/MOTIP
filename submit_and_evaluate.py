@@ -138,6 +138,7 @@ def submit_and_evaluate_one_model(
         inference_only_detr: bool = False,
         dtype: str = "FP32",
         max_tracks: int = 0,
+        max_sequences: int | None = None,
 ):
     # Build the datasets:
     inference_dataset = dataset_classes[dataset](
@@ -153,6 +154,16 @@ def submit_and_evaluate_one_model(
     # Filter out the sequences that will not be processed in this GPU (if we have multiple GPUs):
     _inference_sequence_names = list(inference_dataset.sequence_infos.keys())
     _inference_sequence_names.sort()
+    # Optional deterministic subset (evenly strided over the sorted names), e.g. for fast val during training:
+    if max_sequences is not None and 0 < max_sequences < len(_inference_sequence_names):
+        _stride = len(_inference_sequence_names) / max_sequences
+        _keep = [_inference_sequence_names[int(i * _stride)] for i in range(max_sequences)]
+        for _name in set(_inference_sequence_names) - set(_keep):
+            inference_dataset.sequence_infos.pop(_name)
+            inference_dataset.image_paths.pop(_name)
+        logger.info(f"Evaluating a subset of {len(_keep)}/{len(_inference_sequence_names)} sequences.")
+        _inference_sequence_names = _keep
+    _evaluated_sequence_names = list(_inference_sequence_names)
     # If we have multiple GPUs, we need to filter out the sequences that will not be processed in this GPU:
     # However, there is a special case that the number of GPUs is larger than the number of sequences:
     if len(_inference_sequence_names) <= state.process_index:
@@ -293,7 +304,11 @@ def submit_and_evaluate_one_model(
                     "--SPLIT_TO_EVAL": data_split,
                     "--METRICS": ["HOTA", "CLEAR", "Identity"],
                     "--GT_FOLDER": gt_dir,
-                    "--SEQMAP_FILE": os.path.join(data_root, dataset, f"{data_split}_seqmap.txt"),
+                    "--SEQMAP_FILE": resolve_seqmap(
+                        data_root=data_root, dataset=dataset, data_split=data_split,
+                        sequence_names=_evaluated_sequence_names, outputs_dir=outputs_dir,
+                        is_subset=max_sequences is not None,
+                    ),
                     "--SKIP_SPLIT_FOL": "True",
                     "--TRACKERS_TO_EVAL": "",
                     "--TRACKER_SUB_FOLDER": "",
@@ -379,6 +394,23 @@ def get_results_of_one_sequence(
         tracker_results.append(_results)
     fps = (len(sequence_loader) - 10) / (time.time() - begin_time)
     return tracker_results, fps
+
+
+def resolve_seqmap(data_root: str, dataset: str, data_split: str, sequence_names: list,
+                   outputs_dir: str, is_subset: bool) -> str:
+    """
+    TrackEval seqmap for the evaluated sequences. Uses `{dataset}/{split}_seqmap.txt` when it exists and the full
+    split was evaluated; otherwise (subset, or datasets that ship `seqmaps/{dataset}-{split}.txt` instead, like the
+    Hockey crossing datasets) writes a seqmap of exactly the evaluated sequences into outputs_dir.
+    """
+    default_seqmap = os.path.join(data_root, dataset, f"{data_split}_seqmap.txt")
+    if os.path.exists(default_seqmap) and not is_subset:
+        return default_seqmap
+    seqmap_path = os.path.join(outputs_dir, f"{data_split}_seqmap.txt")
+    with open(seqmap_path, "w") as f:
+        f.write("name\n")
+        f.writelines(f"{name}\n" for name in sequence_names)
+    return seqmap_path
 
 
 def get_eval_metrics_dict(metric_path: str):

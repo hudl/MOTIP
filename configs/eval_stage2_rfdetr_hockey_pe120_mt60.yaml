@@ -1,0 +1,5 @@
+# Inference for REL_PE_LENGTH-120 checkpoints with the tracker memory of the 60-length configs,
+# to compare against s2 / v1 at equal MISS_TOLERANCE.
+SUPER_CONFIG_PATH: ./configs/eval_stage2_rfdetr_hockey.yaml
+REL_PE_LENGTH: 120
+MISS_TOLERANCE: 60

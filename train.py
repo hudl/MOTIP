@@ -2,6 +2,7 @@
 
 import os
 import math
+import contextlib
 import torch
 import einops
 from accelerate import Accelerator
@@ -81,7 +82,10 @@ def train_engine(config: dict):
         length_per_iteration=config["LENGTH_PER_ITERATION"],
         data_weights=data_weights,
         sample_stride=config.get("SAMPLE_STRIDE", 1),
+        short_sequence_mode=config.get("SAMPLE_SHORT_SEQUENCES", "drop"),
     )
+    if config.get("SAMPLE_SHORT_SEQUENCES", "drop") == "whole":
+        assert config["BATCH_SIZE"] == 1, "SAMPLE_SHORT_SEQUENCES: whole gives variable-length samples; needs BATCH_SIZE 1."
     # Build training data loader:
     train_dataloader = DataLoader(
         dataset=train_dataset,
@@ -115,10 +119,21 @@ def train_engine(config: dict):
     id_criterion = build_id_criterion(config=config)
 
     # Build Optimizer:
+    # DETR_FREEZE: detector fully frozen (eval mode, no_grad forward, no DETR losses — only the
+    # last-layer matching the ID loss needs). Implies DETR_NUM_TRAIN_FRAMES = 0.
+    detr_freeze = config.get("DETR_FREEZE", False)
+    if detr_freeze:
+        assert not config["ONLY_DETR"], "DETR_FREEZE with ONLY_DETR leaves nothing to train."
+        config["DETR_NUM_TRAIN_FRAMES"] = 0
     if config["DETR_NUM_TRAIN_FRAMES"] == 0:
         for n, p in model.named_parameters():
-            if "detr" in n:
+            if n.startswith("detr."):
                 p.requires_grad = False     # only train the MOTIP part.
+    _non_detr_named_detr = [n for n, _ in model.named_parameters() if "detr" in n and not n.startswith("detr.")]
+    assert len(_non_detr_named_detr) == 0, f"Params outside the detector contain 'detr': {_non_detr_named_detr[:5]}"
+    _n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    _n_frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    logger.info(f"Trainable params: {_n_trainable:,}, frozen params: {_n_frozen:,} (DETR_FREEZE={detr_freeze}).")
     param_groups = get_param_groups(model, config)
     optimizer = AdamW(
         params=param_groups,
@@ -181,6 +196,52 @@ def train_engine(config: dict):
         # device_placement=[False]        # whether to place the data on the device
     )
 
+    # Validation (decoupled from checkpoint saving):
+    eval_per_epoch = config.get("EVAL_PER_EPOCH", config["SAVE_CHECKPOINT_PER_EPOCH"])
+    best_val = {"HOTA": -1.0, "AssA": -1.0, "epoch": None}
+
+    def run_eval(eval_tag: str):
+        eval_metrics = submit_and_evaluate_one_model(
+            is_evaluate=True,
+            accelerator=accelerator,
+            state=state,
+            logger=logger,
+            model=model,
+            data_root=config["DATA_ROOT"],
+            dataset=config["INFERENCE_DATASET"],
+            data_split=config["INFERENCE_SPLIT"],
+            outputs_dir=os.path.join(outputs_dir, "train", "eval_during_train", eval_tag),
+            image_max_longer=config["INFERENCE_MAX_LONGER"],
+            size_divisibility=config.get("SIZE_DIVISIBILITY", 0),
+            miss_tolerance=config["MISS_TOLERANCE"],
+            use_sigmoid=config["USE_FOCAL_LOSS"] if "USE_FOCAL_LOSS" in config else False,
+            assignment_protocol=config["ASSIGNMENT_PROTOCOL"] if "ASSIGNMENT_PROTOCOL" in config else "hungarian",
+            det_thresh=config["DET_THRESH"],
+            newborn_thresh=config["NEWBORN_THRESH"],
+            id_thresh=config["ID_THRESH"],
+            area_thresh=config["AREA_THRESH"],
+            inference_only_detr=config["INFERENCE_ONLY_DETR"] if config["INFERENCE_ONLY_DETR"] is not None
+            else config["ONLY_DETR"],
+            max_sequences=config.get("INFERENCE_MAX_SEQS"),
+        )
+        eval_metrics.sync()
+        return eval_metrics
+
+    do_eval = config["INFERENCE_DATASET"] is not None
+    if do_eval:
+        assert config["INFERENCE_SPLIT"] is not None, f"Please set the INFERENCE_SPLIT for inference."
+    if do_eval and config.get("EVAL_BEFORE_TRAIN", False):
+        # Baseline of the starting checkpoint — the number the fine-tune has to beat.
+        eval_metrics = run_eval("before_train")
+        logger.metrics(
+            log=f"[Eval before training] ",
+            metrics=eval_metrics,
+            fmt="{global_average:.4f}",
+            statistic="global_average",
+            global_step=train_states["global_step"],
+            prefix="val",
+        )
+
     for epoch in range(train_states["start_epoch"], config["EPOCHS"]):
         logger.info(log=f"Start training epoch {epoch}.")
         epoch_start_timestamp = TPS.timestamp()
@@ -203,6 +264,12 @@ def train_engine(config: dict):
             train_dataset.set_aug_trajectory_switch_prob(switch_prob)
             logger.info(f"AUG_TRAJECTORY_SWITCH_PROB set to {switch_prob:.4f} for epoch {epoch}.")
         train_sampler.prepare_for_epoch(epoch=epoch)
+        _st = train_sampler.last_epoch_stats
+        logger.info(
+            f"Sampler epoch {epoch}: {_st['samples']} samples of length {_st['sample_length']} from {_st['sequences']} sequences; "
+            f"{_st['short']} shorter than the window ({_st['short_kept']} kept whole, {_st['short'] - _st['short_kept']} dropped), "
+            f"{_st['no_window']} long enough but with no legal window."
+        )
         # Train one epoch:
         train_metrics = train_one_epoch(
             accelerator=accelerator,
@@ -229,6 +296,8 @@ def train_engine(config: dict):
             outputs_dir=outputs_dir,
             is_last_epochs=(epoch == config["EPOCHS"] - 1),
             multi_last_checkpoints=config["MULTI_LAST_CHECKPOINTS"],
+            detr_freeze=detr_freeze,
+            detr_frozen_autocast=config.get("DETR_FROZEN_AUTOCAST", "none"),
         )
 
         # Get learning rate:
@@ -257,45 +326,42 @@ def train_engine(config: dict):
                 scheduler=scheduler,
                 only_detr=only_detr,
             )
-            if config["INFERENCE_DATASET"] is not None:
-                assert config["INFERENCE_SPLIT"] is not None, f"Please set the INFERENCE_SPLIT for inference."
-                eval_metrics = submit_and_evaluate_one_model(
-                    is_evaluate=True,
-                    accelerator=accelerator,
-                    state=state,
-                    logger=logger,
+
+        # Validation every EVAL_PER_EPOCH epochs (and always on the last epoch):
+        is_last_epoch = epoch == config["EPOCHS"] - 1
+        if do_eval and ((epoch + 1) % eval_per_epoch == 0 or is_last_epoch):
+            eval_metrics = run_eval(f"epoch_{epoch}")
+            logger.metrics(
+                log=f"[Eval epoch: {epoch}] ",
+                metrics=eval_metrics,
+                fmt="{global_average:.4f}",
+                statistic="global_average",
+                global_step=train_states["global_step"],
+                prefix="val",
+                x_axis_step=epoch,
+                x_axis_name="epoch",
+            )
+            _hota = eval_metrics["HOTA"].global_average
+            _assa = eval_metrics["AssA"].global_average
+            if (_hota, _assa) > (best_val["HOTA"], best_val["AssA"]):
+                best_val.update({"HOTA": _hota, "AssA": _assa, "epoch": epoch})
+                save_checkpoint(
                     model=model,
-                    data_root=config["DATA_ROOT"],
-                    dataset=config["INFERENCE_DATASET"],
-                    data_split=config["INFERENCE_SPLIT"],
-                    outputs_dir=os.path.join(outputs_dir, "train", "eval_during_train", f"epoch_{epoch}"),
-                    image_max_longer=config["INFERENCE_MAX_LONGER"],
-                    size_divisibility=config.get("SIZE_DIVISIBILITY", 0),
-                    miss_tolerance=config["MISS_TOLERANCE"],
-                    use_sigmoid=config["USE_FOCAL_LOSS"] if "USE_FOCAL_LOSS" in config else False,
-                    assignment_protocol=config["ASSIGNMENT_PROTOCOL"] if "ASSIGNMENT_PROTOCOL" in config else "hungarian",
-                    det_thresh=config["DET_THRESH"],
-                    newborn_thresh=config["NEWBORN_THRESH"],
-                    id_thresh=config["ID_THRESH"],
-                    area_thresh=config["AREA_THRESH"],
-                    inference_only_detr=config["INFERENCE_ONLY_DETR"] if config["INFERENCE_ONLY_DETR"] is not None
-                    else config["ONLY_DETR"],
+                    path=os.path.join(outputs_dir, "checkpoint_best.pth"),
+                    states=train_states,
+                    optimizer=None,
+                    scheduler=None,
+                    only_detr=only_detr,
                 )
-                eval_metrics.sync()
-                logger.metrics(
-                    log=f"[Eval epoch: {epoch}] ",
-                    metrics=eval_metrics,
-                    fmt="{global_average:.4f}",
-                    statistic="global_average",
-                    global_step=train_states["global_step"],
-                    prefix="epoch",
-                    x_axis_step=epoch,
-                    x_axis_name="epoch",
-                )
+                logger.success(log=f"New best val HOTA {_hota:.4f} (AssA {_assa:.4f}) at epoch {epoch}.")
+                logger.set_tags({"best_epoch": epoch, "best_val_HOTA": f"{_hota:.4f}"})
 
         logger.success(log=f"Finish training epoch {epoch}.")
         # Prepare for next step:
         scheduler.step()
+    if best_val["epoch"] is not None:
+        logger.success(log=f"Best val HOTA {best_val['HOTA']:.4f} (AssA {best_val['AssA']:.4f}) at epoch {best_val['epoch']}.")
+    logger.finish(status="FINISHED")
     pass
 
 
@@ -326,10 +392,18 @@ def train_one_epoch(
         outputs_dir: str = None,
         is_last_epochs: bool = False,
         multi_last_checkpoints: int = 0,
+        # Frozen detector:
+        detr_freeze: bool = False,
+        detr_frozen_autocast: str = "none",
 ):
     current_last_checkpoint_idx = 0
 
     model.train()
+    if detr_freeze:
+        get_model(model).detr.eval()
+    _frozen_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(str(detr_frozen_autocast).lower())
+    assert _frozen_dtype is not None or str(detr_frozen_autocast).lower() in ("none", "fp32"), \
+        f"Unknown DETR_FROZEN_AUTOCAST '{detr_frozen_autocast}', expected bf16/fp16/none."
     tps = TPS()     # time per step
     metrics = Metrics()
     optimizer.zero_grad()
@@ -343,6 +417,8 @@ def train_one_epoch(
     detr_params = []
     other_params = []
     for name, param in model_without_ddp.named_parameters():
+        if not param.requires_grad:
+            continue
         if "detr" in name:
             detr_params.append(param)
         else:
@@ -409,7 +485,9 @@ def train_one_epoch(
         # DETR forward:
         # 1. no_grad frames:
         if _T > detr_num_train_frames:      # do have no_grad frames (if not, skip this part)
-            with torch.no_grad():
+            _frozen_autocast = torch.autocast(device_type="cuda", dtype=_frozen_dtype) \
+                if (detr_freeze and _frozen_dtype is not None) else contextlib.nullcontext()
+            with torch.no_grad(), _frozen_autocast:
                 if detr_num_checkpoint_frames == 0 or detr_num_checkpoint_frames * 4 >= len(detr_no_grad_frames):
                     # Directly forward the no_grad frames:
                     detr_no_grad_outputs = model(frames=detr_no_grad_frames, part="detr")
@@ -451,7 +529,16 @@ def train_one_epoch(
         detr_outputs = tensor_dict_index_select(detr_outputs, index=go_back_frame_idxs_flatten, dim=0)
 
         # DETR criterion:
-        detr_loss_dict, detr_indices = detr_criterion(outputs=detr_outputs, targets=detr_targets_flatten, batch_len=detr_criterion_batch_len)
+        if detr_freeze:
+            # Frozen detector: no DETR losses, only the last-layer matching the ID loss needs.
+            if _frozen_dtype is not None:
+                detr_outputs = tensor_dict_to_float32(detr_outputs)
+            detr_indices = detr_criterion.match_last_layer(
+                outputs=detr_outputs, targets=detr_targets_flatten, batch_len=detr_criterion_batch_len,
+            )
+            detr_loss_dict = {}
+        else:
+            detr_loss_dict, detr_indices = detr_criterion(outputs=detr_outputs, targets=detr_targets_flatten, batch_len=detr_criterion_batch_len)
 
         # Whether to only train the DETR, OR to train the MOTIP together:
         if not only_detr:
@@ -477,7 +564,8 @@ def train_one_epoch(
         with accelerator.autocast():
             detr_weight_dict = detr_criterion.weight_dict
             detr_loss = sum(
-                detr_loss_dict[k] * detr_weight_dict[k] for k in detr_loss_dict.keys() if k in detr_weight_dict
+                (detr_loss_dict[k] * detr_weight_dict[k] for k in detr_loss_dict.keys() if k in detr_weight_dict),
+                torch.zeros((), device=device),
             )
             loss = detr_loss + (id_loss if id_loss is not None else 0) * id_criterion.weight
             # Logging losses:
@@ -492,14 +580,16 @@ def train_one_epoch(
             if (step + 1) % accumulate_steps == 0:
                 if use_accelerate_clip_norm:
                     if separate_clip_norm:
-                        detr_grad_norm = accelerator.clip_grad_norm_(detr_params, max_norm=max_clip_norm)
+                        detr_grad_norm = accelerator.clip_grad_norm_(detr_params, max_norm=max_clip_norm) \
+                            if len(detr_params) > 0 else torch.zeros((), device=device)
                         other_grad_norm = accelerator.clip_grad_norm_(other_params, max_norm=max_clip_norm)
                     else:
                         detr_grad_norm = other_grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=max_clip_norm)
                 else:
                     if separate_clip_norm:
                         accelerator.unscale_gradients()
-                        detr_grad_norm = torch.nn.utils.clip_grad_norm_(detr_params, max_clip_norm)
+                        detr_grad_norm = torch.nn.utils.clip_grad_norm_(detr_params, max_clip_norm) \
+                            if len(detr_params) > 0 else torch.zeros((), device=device)
                         other_grad_norm = torch.nn.utils.clip_grad_norm_(other_params, max_clip_norm)
                     else:
                         accelerator.unscale_gradients()
@@ -760,6 +850,20 @@ def tensor_dict_cat(tensor_dict1, tensor_dict2, dim=0):
             else:
                 raise ValueError(f"Unsupported type {type(tensor_dict1[k])} in the tensor dict concat.")
         return dict(res_tensor_dict)
+
+
+def tensor_dict_to_float32(tensor_dict):
+    res_tensor_dict = dict()
+    for k, v in tensor_dict.items():
+        if isinstance(v, torch.Tensor):
+            res_tensor_dict[k] = v.float() if v.is_floating_point() else v
+        elif isinstance(v, dict):
+            res_tensor_dict[k] = tensor_dict_to_float32(v)
+        elif isinstance(v, list):
+            res_tensor_dict[k] = [tensor_dict_to_float32(_) for _ in v]
+        else:
+            raise ValueError(f"Unsupported type {type(v)} in the tensor dict float cast.")
+    return res_tensor_dict
 
 
 def tensor_dict_index_select(tensor_dict, index, dim=0):

@@ -194,6 +194,7 @@ def load_checkpoint(model, path, states=None, optimizer=None, scheduler=None):
         load_detr_pretrain(model=model, pretrain_path=path, num_classes=None)
         return
     else:
+        resize_rel_pos_embeds(model, model_state)
         model.load_state_dict(model_state)
 
     if optimizer is not None:
@@ -203,6 +204,27 @@ def load_checkpoint(model, path, states=None, optimizer=None, scheduler=None):
     if states is not None:
         states.update(load_state["states"])
     return
+
+
+def resize_rel_pos_embeds(model, model_state: dict):
+    """Fit checkpoint ID-decoder rel_pos_embeds [layers, REL_PE_LENGTH, heads] to the model's REL_PE_LENGTH.
+
+    Longer: new gaps are initialised from the longest learned gap (so they start out behaving like it and
+    are learned from windows longer than the old length). Shorter: truncated, which drops long-gap weights.
+    """
+    # Called before accelerator.prepare(), so the model may not be DDP-wrapped yet even when distributed.
+    target = dict((model.module if hasattr(model, "module") else model).named_parameters())
+    for k in [k for k in model_state if k.endswith("rel_pos_embeds")]:
+        if k not in target or model_state[k].shape == target[k].shape:
+            continue
+        old, new_len = model_state[k], target[k].shape[1]
+        if new_len > old.shape[1]:
+            pad = old[:, -1:, :].expand(-1, new_len - old.shape[1], -1)
+            model_state[k] = torch.cat([old, pad], dim=1).contiguous()
+        else:
+            model_state[k] = old[:, :new_len, :].contiguous()
+        print(f"[load_checkpoint] resized {k}: REL_PE_LENGTH {old.shape[1]} -> {new_len}"
+              + (" (TRUNCATED: long-gap weights dropped)" if new_len < old.shape[1] else ""))
 
 
 def _get_clones(module, N):

@@ -31,9 +31,21 @@ class DanceTrack(OneDataset):
             self.annotations = self._get_annotations()
         return
 
+    # File/dir whose presence marks a complete sequence. Subclasses whose layout has no seqinfo.ini
+    # (e.g. BFT, which reads lengths from img1/) override this.
+    sequence_marker = "seqinfo.ini"
+
     def _get_sequence_names(self):
         base = os.path.join(self.data_dir, self.split)
-        return [e for e in os.listdir(base) if os.path.isdir(os.path.join(base, e))]
+        dirs = [e for e in os.listdir(base) if os.path.isdir(os.path.join(base, e))]
+        # Only complete sequences: a dataset builder that bails out mid-sequence can leave an img1-only
+        # directory with no seqinfo.ini / gt, which would otherwise crash image-path/annotation loading.
+        names = [e for e in dirs if os.path.exists(os.path.join(base, e, self.sequence_marker))]
+        if len(names) != len(dirs):
+            skipped = sorted(set(dirs) - set(names))
+            print(f"[{type(self).__name__}] skipping {len(skipped)} incomplete sequence dir(s) in {base} "
+                  f"(no {self.sequence_marker}): {skipped[:5]}")
+        return names
 
     def _get_sequence_infos(self):
         sequence_names = self._get_sequence_names()
