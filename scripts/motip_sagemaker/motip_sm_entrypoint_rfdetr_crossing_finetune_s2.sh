@@ -8,7 +8,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 python -c "import torch; print('torch', torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.device_count())"
 
-pip install --no-cache-dir accelerate wandb einops pyyaml mlflow "transformers>=4.46.0,<5.0.0" timm peft
+# transformers 5.x to match aml-ice-hockey master rfdetr 1.3.1 (be1234f7 targets the transformers-5 backbone API)
+pip install --no-cache-dir accelerate wandb einops pyyaml mlflow "transformers==5.16.1" timm "peft==0.20.0"
 echo "=== Installing scipy fallback for torch_linear_assignment ==="
 python - << PYEOF
 import site, pathlib
