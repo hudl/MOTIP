@@ -184,6 +184,20 @@ def run_detr_pass(model, cfg, frames: list, vid_w: int, vid_h: int) -> list:
     return det_cache
 
 
+def _rows(track_results, ids_list, bboxes_cpu):
+    """Per-detection rows with the DETR score, ID-decoder stats (see RuntimeTracker.id_stats)
+    and the detection's index in its frame's det_cache entry (the stored embeds file)."""
+    det = track_results["score"].float().cpu().tolist()
+    # NaN (no trajectory to decode against yet) becomes None, so the rows stay valid JSON
+    st = [[None if v != v else v for v in r] for r in track_results["id_stats"].cpu().tolist()]
+    idx = track_results["det_idx"].cpu().tolist()
+    return [
+        {"track_id": oid, "bbox": [x, y, x + w, y + h],
+         "score": d, "id_score": s[0], "id_top1": s[1], "id_margin": s[2], "det_idx": i}
+        for oid, (x, y, w, h), d, s, i in zip(ids_list, bboxes_cpu.tolist(), det, st, idx)
+    ]
+
+
 def run_sequence_from_frames(
     model, cfg, frames: list, vid_w: int, vid_h: int,
     det_cache: list | None = None,
@@ -228,10 +242,7 @@ def run_sequence_from_frames(
             track_results = runtime_tracker.get_track_results()
             bboxes_cpu = track_results["bbox"].cpu()
             ids_list = track_results["id"].tolist()
-            results[t + 1] = [
-                {"track_id": oid, "bbox": [x, y, x + w, y + h]}
-                for oid, (x, y, w, h) in zip(ids_list, bboxes_cpu.tolist())
-            ]
+            results[t + 1] = _rows(track_results, ids_list, bboxes_cpu)
         return results
 
     # Normal path: run full model (DETR + ID decoder) per frame.
@@ -261,10 +272,7 @@ def run_sequence_from_frames(
 
         bboxes_cpu = track_results["bbox"].cpu()
         ids_list = track_results["id"].tolist()
-        results[t + 1] = [
-            {"track_id": oid, "bbox": [x, y, x + w, y + h]}
-            for oid, (x, y, w, h) in zip(ids_list, bboxes_cpu.tolist())
-        ]
+        results[t + 1] = _rows(track_results, ids_list, bboxes_cpu)
 
     return results
 

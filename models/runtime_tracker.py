@@ -91,6 +91,7 @@ class RuntimeTracker:
         # self.trajectory_features = torch.zeros(())
 
         self.current_track_results = {}
+        self._frame_id_scores = None
         return
 
     @torch.no_grad()
@@ -115,6 +116,9 @@ class RuntimeTracker:
 
     def _process_detections(self, scores, categories, boxes, output_embeds, suppress_boxes=None):
         """Apply goalie suppression, ID decoder, trajectory update from pre-extracted detections."""
+        # Index of each detection in this frame's input (the det_cache entry), kept through
+        # every filter below so a track row can be joined back to its stored embedding.
+        det_idx = torch.arange(boxes.shape[0], device=boxes.device)
         # Suppress detections matching goalkeeper boxes
         if suppress_boxes is not None and len(suppress_boxes) > 0 and len(boxes) > 0:
             boxes_xyxy = box_cxcywh_to_xyxy(boxes) * self.bbox_unnorm
@@ -137,10 +141,12 @@ class RuntimeTracker:
             categories = categories[keep]
             boxes = boxes[keep]
             output_embeds = output_embeds[keep]
+            det_idx = det_idx[keep]
         if self.only_detr:
             id_pred_labels = self.num_id_vocabulary * torch.ones(boxes.shape[0], dtype=torch.int64, device=boxes.device)
         else:
             id_pred_labels = self._get_id_pred_labels(boxes=boxes, output_embeds=output_embeds)
+        id_stats = self._id_stats(id_pred_labels)
 
         # Filter out illegal newborn detections:
         n_active = self.trajectory_id_labels.shape[1] if self.trajectory_id_labels.shape[0] > 0 else 0
@@ -183,7 +189,9 @@ class RuntimeTracker:
         categories = categories[keep_idxs]
         boxes = boxes[keep_idxs]
         output_embeds = output_embeds[keep_idxs]
+        det_idx = det_idx[keep_idxs]
         id_pred_labels = id_pred_labels[keep_idxs]
+        id_stats = id_stats[keep_idxs]
 
         # A hack implementation, before assign new id labels, update the id_queue to ensure the uniqueness of id labels:
         n_activate_id_labels = 0
@@ -207,7 +215,9 @@ class RuntimeTracker:
             categories = categories[keep_idxs]
             boxes = boxes[keep_idxs]
             output_embeds = output_embeds[keep_idxs]
+            det_idx = det_idx[keep_idxs]
             id_pred_labels = id_pred_labels[keep_idxs]
+            id_stats = id_stats[keep_idxs]
         pass
 
         # Assign new id labels:
@@ -230,6 +240,13 @@ class RuntimeTracker:
             # "bbox". These are what the id_decoder consumes to judge identity, so they
             # are usable as appearance features by an external tracker.
             "embed": output_embeds,
+            # (N, 3) per detection: ID-decoder prob of the label it was given (newborn token
+            # included), top-1 prob over existing IDs, top-1 minus top-2 margin. NaN when no
+            # trajectory existed to decode against (first frame / only_detr).
+            "id_stats": id_stats,
+            # (N,) index of each detection in this frame's det_cache entry (= the stored
+            # embeds file), in the same order as "bbox".
+            "det_idx": det_idx,
         }
 
         # Update id_queue:
@@ -266,7 +283,22 @@ class RuntimeTracker:
         categories = categories[activate_indices]
         return scores, categories, boxes, output_embeds
 
+    def _id_stats(self, labels: torch.Tensor) -> torch.Tensor:
+        n = labels.shape[0]
+        out = torch.full((n, 3), float("nan"), dtype=torch.float32, device=labels.device)
+        s = self._frame_id_scores
+        if s is None or n == 0 or s.shape[0] != n:
+            return out
+        s = s.float()
+        out[:, 0] = s[torch.arange(n, device=s.device), labels.clamp(max=s.shape[1] - 1)]
+        real = s[:, :self.num_id_vocabulary]
+        top2 = real.topk(min(2, real.shape[1]), dim=-1).values
+        out[:, 1] = top2[:, 0]
+        out[:, 2] = top2[:, 0] - (top2[:, 1] if top2.shape[1] > 1 else 0.0)
+        return out
+
     def _get_id_pred_labels(self, boxes: torch.Tensor, output_embeds: torch.Tensor):
+        self._frame_id_scores = None
         if self.trajectory_features.shape[0] == 0:
             return self.num_id_vocabulary * torch.ones(boxes.shape[0], dtype=torch.int64, device=boxes.device)
         else:
@@ -309,6 +341,7 @@ class RuntimeTracker:
 
             id_pred_labels = torch.tensor(id_labels, dtype=torch.int64, device=distributed_device())
             self._last_id_scores = id_scores
+            self._frame_id_scores = id_scores
             return id_pred_labels
 
     def _assign_newborn_id_labels(self, pred_id_labels: torch.Tensor):
