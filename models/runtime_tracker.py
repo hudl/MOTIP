@@ -146,7 +146,6 @@ class RuntimeTracker:
             id_pred_labels = self.num_id_vocabulary * torch.ones(boxes.shape[0], dtype=torch.int64, device=boxes.device)
         else:
             id_pred_labels = self._get_id_pred_labels(boxes=boxes, output_embeds=output_embeds)
-        id_stats = self._id_stats(id_pred_labels)
 
         # Filter out illegal newborn detections:
         n_active = self.trajectory_id_labels.shape[1] if self.trajectory_id_labels.shape[0] > 0 else 0
@@ -185,6 +184,8 @@ class RuntimeTracker:
             keep_idxs = (id_pred_labels != self.num_id_vocabulary) | (scores > self.newborn_thresh)
         else:
             keep_idxs = (id_pred_labels != self.num_id_vocabulary) | (scores > self.newborn_thresh)
+        # After the max-tracks block, which can move a newborn onto an existing ID
+        id_stats = self._id_stats(id_pred_labels)
         scores = scores[keep_idxs]
         categories = categories[keep_idxs]
         boxes = boxes[keep_idxs]
@@ -284,17 +285,24 @@ class RuntimeTracker:
         return scores, categories, boxes, output_embeds
 
     def _id_stats(self, labels: torch.Tensor) -> torch.Tensor:
+        """Return (N, 3) per detection: P(label it was given), top-1 P over live IDs, margin.
+
+        The label column includes the newborn token. Top-1 and the top-1 minus top-2 margin
+        are taken only over the IDs of live trajectories, since the decoder also gives a little
+        probability to unused IDs; with one live trajectory the margin is its probability.
+        All NaN when there were no trajectories to decode against (first frame, only_detr).
+        """
         n = labels.shape[0]
         out = torch.full((n, 3), float("nan"), dtype=torch.float32, device=labels.device)
         s = self._frame_id_scores
-        if s is None or n == 0 or s.shape[0] != n:
+        if s is None or n == 0 or s.shape[0] != n or self.trajectory_id_labels.shape[0] == 0:
             return out
         s = s.float()
         out[:, 0] = s[torch.arange(n, device=s.device), labels.clamp(max=s.shape[1] - 1)]
-        real = s[:, :self.num_id_vocabulary]
-        top2 = real.topk(min(2, real.shape[1]), dim=-1).values
+        live = s[:, self.trajectory_id_labels[0].unique()]
+        top2 = live.topk(min(2, live.shape[1]), dim=-1).values
         out[:, 1] = top2[:, 0]
-        out[:, 2] = top2[:, 0] - (top2[:, 1] if top2.shape[1] > 1 else 0.0)
+        out[:, 2] = top2[:, 0] - top2[:, 1] if top2.shape[1] > 1 else top2[:, 0]
         return out
 
     def _get_id_pred_labels(self, boxes: torch.Tensor, output_embeds: torch.Tensor):
