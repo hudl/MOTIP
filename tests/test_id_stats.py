@@ -12,11 +12,18 @@ from models.runtime_tracker import RuntimeTracker
 VOCAB = 5
 
 
-def _tracker(live_labels: list[int], scores: list[list[float]] | None) -> RuntimeTracker:
+def _tracker(
+    live_labels: list[int], scores: list[list[float]] | None, *, history: int = 2
+) -> RuntimeTracker:
     t = object.__new__(RuntimeTracker)
     t.num_id_vocabulary = VOCAB
-    # (T, N): every frame of a trajectory carries its label; T = 0 means no trajectories yet
-    t.trajectory_id_labels = torch.tensor([live_labels, live_labels]) if live_labels else torch.zeros((0, 0), dtype=torch.int64)
+    # (T, N): every frame of a trajectory carries its label. T = 0 means no trajectories yet;
+    # T > 0 with N = 0 is a history whose trajectories have all gone inactive.
+    t.trajectory_id_labels = (
+        torch.tensor([live_labels] * history)
+        if live_labels
+        else torch.zeros((history, 0), dtype=torch.int64)
+    )
     t._frame_id_scores = torch.tensor(scores) if scores is not None else None
     return t
 
@@ -44,6 +51,14 @@ def test_one_live_trajectory_margin_is_its_probability() -> None:
 
 
 def test_no_trajectories_is_all_nan() -> None:
-    out = _tracker([], None)._id_stats(torch.tensor([VOCAB, VOCAB]))
+    out = _tracker([], None, history=0)._id_stats(torch.tensor([VOCAB, VOCAB]))
+    assert out.shape == (2, 3)
+    assert torch.isnan(out).all()
+
+
+def test_history_with_no_live_trajectory_is_all_nan() -> None:
+    # every track went unseen for the whole miss window (a long stoppage or a camera cut):
+    # the decoder still ran, so there are scores, but there is no live ID to compare against
+    out = _tracker([], [[0.1, 0.1, 0.1, 0.1, 0.1, 0.5]] * 2)._id_stats(torch.tensor([VOCAB, VOCAB]))
     assert out.shape == (2, 3)
     assert torch.isnan(out).all()
