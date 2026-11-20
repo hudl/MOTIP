@@ -14,6 +14,7 @@ Response format:
 Startup signal: prints "MOTIP_READY" to stdout when model is loaded.
 """
 import json
+import logging
 import os
 import sys
 import time
@@ -35,7 +36,8 @@ sys.path.insert(0, MOTIP_ROOT)
 from utils.misc import yaml_to_dict
 from configs.util import load_super_config, update_config
 from data.seq_dataset import SeqDataset
-from models.runtime_tracker import RuntimeTracker
+from models.runtime_tracker import RuntimeTracker, FixedLagTracker, QuarantineRewriter, ConfirmFilter
+from models.lookahead_tracker import LookaheadTracker
 from models.motip import build as build_motip
 from models.misc import load_checkpoint
 from accelerate import Accelerator
@@ -170,6 +172,9 @@ def run_detr_pass(model, cfg, frames: list, vid_w: int, vid_h: int) -> list:
         only_detr=True,
         dtype=dtype,
         max_tracks=cfg.get("MAX_TRACKS", 0),
+        spatial_gate=cfg.get("SPATIAL_GATE", False),
+        gate_base=cfg.get("GATE_BASE", 0.5),
+        gate_per_step=cfg.get("GATE_PER_STEP", 0.2),
     )
     det_cache = []
     with torch.no_grad():
@@ -191,18 +196,90 @@ def _rows(track_results, ids_list, bboxes_cpu):
     # NaN (no trajectory to decode against yet) becomes None, so the rows stay valid JSON
     st = [[None if v != v else v for v in r] for r in track_results["id_stats"].cpu().tolist()]
     idx = track_results["det_idx"].cpu().tolist()
-    return [
+    rows = [
         {"track_id": oid, "bbox": [x, y, x + w, y + h],
          "score": d, "id_score": s[0], "id_top1": s[1], "id_margin": s[2], "det_idx": i}
         for oid, (x, y, w, h), d, s, i in zip(ids_list, bboxes_cpu.tolist(), det, st, idx)
     ]
+    if "id_topk" in track_results:  # cfg ID_TOPK > 0 only: [[output id, prob], ...] per row, best first
+        for r, tk in zip(rows, track_results["id_topk"].tolist()):
+            r["id_topk"] = [[int(a), None if b != b else b] for a, b in tk if a >= 0]
+    return rows
+
+
+def _rink_kwargs(cfg: dict, rink: dict | None) -> dict:
+    """RuntimeTracker kwargs for the rink gate / rink anchor from the config keys and this clip's ``rink`` dict."""
+    kw = dict(
+        rink_gate=bool(cfg.get("RINK_GATE", False)),
+        rink_gate_base_m=cfg.get("RINK_GATE_BASE_M", 2.0),
+        rink_gate_speed_mps=cfg.get("RINK_GATE_SPEED_MPS", 10.0),
+        rink_anchor=bool(cfg.get("RINK_ANCHOR", False)),
+        team_cue=bool(cfg.get("TEAM_CUE", False)),
+        quarantine=bool(cfg.get("QUARANTINE", False)),
+        quarantine_iou=float(cfg.get("QUARANTINE_IOU", 0.3)),
+        quarantine_max=int(cfg.get("QUARANTINE_MAX", 30)),
+        n_init=int(cfg.get("N_INIT", 1)),
+        newborn_max_iou=float(cfg.get("NEWBORN_MAX_IOU", 0.0)),
+        id_topk=int(cfg.get("ID_TOPK", 0) or 0),
+    )
+    if rink is not None:
+        kw["rink_fps"] = float(rink["fps"])
+        kw["rink_bounds_m"] = tuple(rink["bounds_m"])
+    return kw
+
+
+def _fixed_lag(cfg: dict, runtime_tracker):
+    """FixedLagTracker around ``runtime_tracker`` when cfg ``FIXED_LAG`` (frames) > 0, a QuarantineRewriter when cfg
+    ``QUARANTINE_REWRITE`` is on (needs ``QUARANTINE``), else None (online, unchanged)."""
+    lag = int(cfg.get("FIXED_LAG", 0) or 0)
+    la_lag = int(cfg.get("LOOKAHEAD_LAG", 0) or 0)
+    if la_lag > 0:
+        # Look-ahead decoder (model built with LOOKAHEAD): frame t decided when t + LOOKAHEAD_LAG has arrived.
+        if lag > 0 or cfg.get("QUARANTINE_REWRITE", False):
+            raise ValueError("LOOKAHEAD_LAG is exclusive with FIXED_LAG and QUARANTINE_REWRITE")
+        return LookaheadTracker(
+            runtime_tracker, lag=la_lag,
+            frame_stride=int(cfg.get("LOOKAHEAD_FRAME_STRIDE", 4)),
+            trigger=str(cfg.get("LOOKAHEAD_TRIGGER", "always")),
+            trigger_p=float(cfg.get("LOOKAHEAD_TRIGGER_P", 0.99)),
+        )
+    if cfg.get("QUARANTINE_REWRITE", False):
+        if lag > 0:
+            raise ValueError("FIXED_LAG and QUARANTINE_REWRITE are exclusive")
+        return QuarantineRewriter(runtime_tracker, max_buffer=int(cfg.get("QUARANTINE_REWRITE_MAX", 60)),
+                                  link_iou=float(cfg.get("QUARANTINE_LINK_IOU", 0.3)))
+    if lag <= 0:
+        return None
+    return FixedLagTracker(
+        runtime_tracker, lag=lag,
+        margin=float(cfg.get("FIXED_LAG_MARGIN", 2.0)),
+        max_hyps=int(cfg.get("FIXED_LAG_MAX_HYPS", 4)),
+        max_branch=int(cfg.get("FIXED_LAG_MAX_BRANCH", 2)),
+        near=float(cfg.get("FIXED_LAG_NEAR", 1.0)),
+        penalty=float(cfg.get("FIXED_LAG_PENALTY", 0.0)),
+        kinds=tuple(cfg.get("FIXED_LAG_KINDS", ("swap", "move", "give"))),
+        score=str(cfg.get("FIXED_LAG_SCORE", "own")),
+    )
+
+
+def _rink_H(rink: dict | None, t: int):
+    """This call's t-th frame's image -> rink matrix, or None past the end / without transforms."""
+    if rink is None or t >= len(rink["H"]):
+        return None
+    return rink["H"][t]
 
 
 def run_sequence_from_frames(
     model, cfg, frames: list, vid_w: int, vid_h: int,
     det_cache: list | None = None,
+    rink: dict | None = None,
 ) -> dict:
     """Run inference on pre-decoded BGR numpy frames. Returns {frame_1indexed: [detections]}.
+
+    ``rink`` feeds the rink-space gate (cfg ``RINK_GATE``) and the rink anchor (cfg ``RINK_ANCHOR``):
+    ``{"H": (T, 3, 3) per-frame image px -> rink metres matrices, NaN where a frame has none, "fps": float,
+    "bounds_m": (x, y)}``. ``H[t]`` belongs to the t-th frame of this call. Without it the rink gate never
+    gates and every rink-anchor token is "no position".
 
     Drop-in for run_sequence when frames are already in memory — no JPEG I/O.
 
@@ -211,6 +288,9 @@ def run_sequence_from_frames(
     """
     dtype_str = cfg.get("INFERENCE_DTYPE", "FP32")
     dtype = torch.float16 if dtype_str == "FP16" else torch.float32
+    if cfg.get("RINK_ANCHOR", False) and rink is None:
+        logging.getLogger(__name__).warning(
+            "RINK_ANCHOR is on but no rink transforms were given: every token gets the no-position embedding.")
 
     sequence_hw = (vid_h, vid_w)
     runtime_tracker = RuntimeTracker(
@@ -228,21 +308,64 @@ def run_sequence_from_frames(
                    else cfg.get("ONLY_DETR", False)),
         dtype=dtype,
         max_tracks=cfg.get("MAX_TRACKS", 0),
+        spatial_gate=cfg.get("SPATIAL_GATE", False),
+        gate_base=cfg.get("GATE_BASE", 0.5),
+        gate_per_step=cfg.get("GATE_PER_STEP", 0.2),
+        **_rink_kwargs(cfg, rink),
     )
 
     results = {}
+    # Fixed-lag identity decisions (cfg FIXED_LAG > 0; off by default): frame t's tracks come out at t + FIXED_LAG,
+    # after the ambiguous assignments up to t were resolved (FixedLagTracker). Same rows, same frame keys.
+    lagger = _fixed_lag(cfg, runtime_tracker)
+    # Tracklet confirmation (cfg N_INIT > 1): emitted frames are held N_INIT - 1 frames so a dropped tentative track's
+    # boxes can be removed; confirmed tracks keep theirs (backfill).
+    confirm = ConfirmFilter(runtime_tracker.n_init) if runtime_tracker.n_init > 1 else None
+
+    def _emit(ready, final=False):
+        if confirm is not None:
+            ready = confirm.push(ready) + (confirm.finish() if final else [])
+        for t_done, tr in ready:
+            results[t_done + 1] = _rows(tr, tr["id"].tolist(), tr["bbox"].cpu())
+
+    def _log_lag(trk):
+        if lagger is not None:
+            logging.getLogger(__name__).info("fixed-lag stats (%s): %s", getattr(lagger, "lag", "quarantine"), lagger.stats)
+        if trk.quarantine:
+            logging.getLogger(__name__).info("quarantine stats: %s", trk.q_stats)
+        if trk.n_init > 1 or trk.newborn_max_iou > 0:
+            logging.getLogger(__name__).info("confirmation stats (n_init %d, newborn_max_iou %.2f): %s%s", trk.n_init,
+                                             trk.newborn_max_iou, trk.n_stats, f", {confirm.stats}" if confirm else "")
 
     if det_cache is not None:
         # Fast path: DETR already ran, only run ID decoder.
-        for t, (scores, categories, boxes, output_embeds) in enumerate(det_cache):
-            runtime_tracker.update_from_detections(
-                scores.to("cuda"), categories.to("cuda"),
-                boxes.to("cuda"), output_embeds.to("cuda", dtype=dtype),
-            )
+        if cfg.get("TEAM_CUE", False) and not any(len(e) > 4 for e in det_cache):
+            logging.getLogger(__name__).warning(
+                "TEAM_CUE is on but the det_cache carries no kit descriptors: every token gets the 'missing' vector.")
+        for t, entry in enumerate(det_cache):
+            scores, categories, boxes, output_embeds = entry[:4]
+            det_args = (scores.to("cuda"), categories.to("cuda"), boxes.to("cuda"), output_embeds.to("cuda", dtype=dtype))
+            det_kw = dict(rink_H=_rink_H(rink, t), kit=entry[4] if len(entry) > 4 else None)
+            if lagger is not None:
+                _emit(lagger.update_from_detections(*det_args, **det_kw))
+                continue
+            runtime_tracker.update_from_detections(*det_args, **det_kw)
             track_results = runtime_tracker.get_track_results()
+            if confirm is not None:
+                _emit([(t, track_results)])
+                continue
             bboxes_cpu = track_results["bbox"].cpu()
             ids_list = track_results["id"].tolist()
             results[t + 1] = _rows(track_results, ids_list, bboxes_cpu)
+        if lagger is not None or confirm is not None:
+            _emit(lagger.finish() if lagger is not None else [], final=True)
+        if lagger is not None:
+            runtime_tracker = lagger.tracker
+        _log_lag(runtime_tracker)
+        if runtime_tracker.spatial_gate or runtime_tracker.rink_gate:
+            logging.getLogger(__name__).info("spatial gate stats: %s", runtime_tracker.gate_stats)
+        if runtime_tracker.rink_gate:
+            logging.getLogger(__name__).info("rink gate stats: %s", runtime_tracker.rink_stats)
         return results
 
     # Normal path: run full model (DETR + ID decoder) per frame.
@@ -267,13 +390,22 @@ def run_sequence_from_frames(
     for t, (image, _) in enumerate(sequence_loader):
         image.tensors = image.tensors.cuda()
         image.mask = image.mask.cuda()
-        runtime_tracker.update(image=image)
+        if lagger is not None:
+            _emit(lagger.update(image=image, rink_H=_rink_H(rink, t), frame_bgr=frames[t] if cfg.get("TEAM_CUE", False) else None))
+            continue
+        runtime_tracker.update(image=image, rink_H=_rink_H(rink, t), frame_bgr=frames[t] if cfg.get("TEAM_CUE", False) else None)
         track_results = runtime_tracker.get_track_results()
+        if confirm is not None:
+            _emit([(t, track_results)])
+            continue
 
         bboxes_cpu = track_results["bbox"].cpu()
         ids_list = track_results["id"].tolist()
         results[t + 1] = _rows(track_results, ids_list, bboxes_cpu)
 
+    if lagger is not None or confirm is not None:
+        _emit(lagger.finish() if lagger is not None else [], final=True)
+    _log_lag(lagger.tracker if lagger is not None else runtime_tracker)
     return results
 
 
@@ -330,6 +462,9 @@ def run_sequence(model, cfg, seq_dir: str, seq_name: str) -> dict:
         only_detr=cfg.get("INFERENCE_ONLY_DETR", False) if cfg.get("INFERENCE_ONLY_DETR") is not None else cfg.get("ONLY_DETR", False),
         dtype=dtype,
         max_tracks=cfg.get("MAX_TRACKS", 0),
+        spatial_gate=cfg.get("SPATIAL_GATE", False),
+        gate_base=cfg.get("GATE_BASE", 0.5),
+        gate_per_step=cfg.get("GATE_PER_STEP", 0.2),
     )
 
     results = {}

@@ -3,6 +3,7 @@
 import os
 import math
 import contextlib
+import numpy as np
 import torch
 import einops
 from accelerate import Accelerator
@@ -28,6 +29,7 @@ from log.log import TPS, Metrics
 from models.misc import load_detr_pretrain, save_checkpoint, load_checkpoint
 from models.misc import get_model
 from utils.nested_tensor import NestedTensor
+from utils.switch_stats import empty_switch_stats, add_switch_stats, clip_switch_stats, summarize_switch_stats
 from submit_and_evaluate import submit_and_evaluate_one_model
 
 
@@ -66,6 +68,14 @@ def train_engine(config: dict):
     # Build training dataset:
     train_dataset = build_dataset(config=config)
     logger.dataset(train_dataset)
+    # Cached frozen-detector outputs (skips the detector forward; see utils/detr_cache.py):
+    detr_cache = None
+    if config.get("DETR_CACHE_DIR"):
+        assert config.get("DETR_FREEZE", False) and not config["ONLY_DETR"], "DETR_CACHE_DIR needs DETR_FREEZE and an ID head to train."
+        from utils.detr_cache import DetrCache
+        detr_cache = DetrCache(config["DETR_CACHE_DIR"], with_kit=config.get("TEAM_CUE", False),
+                              max_open=config.get("DETR_CACHE_MAX_OPEN", 32))  # sequences kept in RAM (LRU)
+        logger.info(f"DETR_CACHE_DIR={config['DETR_CACHE_DIR']}: detector forward skipped, flip aug on cached boxes={config.get('DETR_CACHE_FLIP', False)}.")
     # Build training data sampler:
     if "DATASET_WEIGHTS" in config:
         data_weights = defaultdict(lambda: defaultdict())
@@ -74,16 +84,30 @@ def train_engine(config: dict):
         data_weights = dict(data_weights)
     else:
         data_weights = None
-    train_sampler = NaiveSampler(
-        data_source=train_dataset,
-        sample_steps=config["SAMPLE_STEPS"],
-        sample_lengths=config["SAMPLE_LENGTHS"],
-        sample_intervals=config["SAMPLE_INTERVALS"],
-        length_per_iteration=config["LENGTH_PER_ITERATION"],
-        data_weights=data_weights,
-        sample_stride=config.get("SAMPLE_STRIDE", 1),
-        short_sequence_mode=config.get("SAMPLE_SHORT_SEQUENCES", "drop"),
-    )
+    if config.get("SAMPLE_MANIFEST"):
+        # Explicit candidate windows (data/manifest_sampler.py); SAMPLE_LENGTHS / INTERVALS / STRIDE are then unused.
+        from data.manifest_sampler import ManifestSampler, resolve_manifest_path
+        train_sampler = ManifestSampler(
+            data_source=train_dataset,
+            manifest=resolve_manifest_path(config["SAMPLE_MANIFEST"], config.get("DATA_ROOT")),
+            seed=config["SEED"],
+            samples_per_epoch=config.get("SAMPLE_MANIFEST_SAMPLES"),
+        )
+        if train_sampler.variable_length:
+            assert config["BATCH_SIZE"] == 1, f"SAMPLE_MANIFEST has windows of lengths {train_sampler.lengths}; needs BATCH_SIZE 1."
+        logger.info(f"SAMPLE_MANIFEST={config['SAMPLE_MANIFEST']}: {len(train_sampler.windows)} candidate windows, "
+                    f"{train_sampler.samples_per_epoch} per epoch, lengths {train_sampler.lengths}, dropped {train_sampler.dropped}.")
+    else:
+        train_sampler = NaiveSampler(
+            data_source=train_dataset,
+            sample_steps=config["SAMPLE_STEPS"],
+            sample_lengths=config["SAMPLE_LENGTHS"],
+            sample_intervals=config["SAMPLE_INTERVALS"],
+            length_per_iteration=config["LENGTH_PER_ITERATION"],
+            data_weights=data_weights,
+            sample_stride=config.get("SAMPLE_STRIDE", 1),
+            short_sequence_mode=config.get("SAMPLE_SHORT_SEQUENCES", "drop"),
+        )
     if config.get("SAMPLE_SHORT_SEQUENCES", "drop") == "whole":
         assert config["BATCH_SIZE"] == 1, "SAMPLE_SHORT_SEQUENCES: whole gives variable-length samples; needs BATCH_SIZE 1."
     # Build training data loader:
@@ -134,6 +158,39 @@ def train_engine(config: dict):
     _n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     _n_frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
     logger.info(f"Trainable params: {_n_trainable:,}, frozen params: {_n_frozen:,} (DETR_FREEZE={detr_freeze}).")
+    if config.get("SPATIAL_ANCHOR", False):
+        # The anchor reuses the detector's ref_point_head; with a frozen detector it must stay frozen.
+        _head = [p for n, p in model.named_parameters() if "ref_point_head" in n]
+        assert len(_head) > 0, "SPATIAL_ANCHOR: no ref_point_head found in the detector."
+        _head_trainable = any(p.requires_grad for p in _head)
+        logger.info(f"SPATIAL_ANCHOR on: ref_point_head {sum(p.numel() for p in _head):,} params, trainable={_head_trainable}.")
+        if detr_freeze:
+            assert not _head_trainable, "DETR_FREEZE must keep the ref_point_head used by SPATIAL_ANCHOR frozen."
+    if config.get("RINK_ANCHOR", False):
+        _rink = [(n, p) for n, p in model.named_parameters() if n.startswith("rink_anchor.")]
+        assert len(_rink) > 0, "RINK_ANCHOR: the model has no rink_anchor parameters."
+        assert all(p.requires_grad for _, p in _rink), "RINK_ANCHOR parameters must be trainable."
+        logger.info(
+            f"RINK_ANCHOR on: {sum(p.numel() for _, p in _rink):,} params, dropout={config.get('RINK_ANCHOR_DROPOUT', 0.0)}, "
+            f"lr x{config.get('LR_RINK_ANCHOR_SCALE', 1.0)}."
+        )
+    if config.get("TEAM_CUE", False):
+        _cue = [(n, p) for n, p in model.named_parameters() if n.startswith("team_cue.")]
+        assert len(_cue) > 0, "TEAM_CUE: the model has no team_cue parameters."
+        assert all(p.requires_grad for _, p in _cue), "TEAM_CUE parameters must be trainable."
+        assert detr_cache is not None and config.get("TEAM_CUE", False), "TEAM_CUE training needs DETR_CACHE_DIR built with --kit (the kit descriptors)."
+        _stats_path = config.get("KIT_STATS_PATH") or os.path.join(config["DETR_CACHE_DIR"], "kit_stats.json")
+        import json
+        with open(_stats_path) as _fh:
+            _stats = json.load(_fh)
+        model.team_cue.set_stats(_stats["mean"], _stats["std"])
+        logger.info(
+            f"TEAM_CUE on: {sum(p.numel() for _, p in _cue):,} params, dropout={config.get('TEAM_CUE_DROPOUT', 0.1)}, "
+            f"gate init={config.get('TEAM_CUE_GATE_INIT', 0.25)}, lr x{config.get('LR_TEAM_CUE_SCALE', 1.0)}, "
+            f"kit stats from {_stats_path} ({_stats['n_rows']:,} rows)."
+        )
+    # Record the size of the added cue terms (kit, box anchor) on every ID-decoder forward and log them (cue_* metrics).
+    model.record_cue_stats = bool(config.get("TEAM_CUE", False) or config.get("SPATIAL_ANCHOR", False))
     param_groups = get_param_groups(model, config)
     optimizer = AdamW(
         params=param_groups,
@@ -223,6 +280,10 @@ def train_engine(config: dict):
             inference_only_detr=config["INFERENCE_ONLY_DETR"] if config["INFERENCE_ONLY_DETR"] is not None
             else config["ONLY_DETR"],
             max_sequences=config.get("INFERENCE_MAX_SEQS"),
+            spatial_gate=config.get("SPATIAL_GATE", False),
+            gate_base=config.get("GATE_BASE", 0.5),
+            gate_per_step=config.get("GATE_PER_STEP", 0.2),
+            rink_anchor=config.get("RINK_ANCHOR", False),
         )
         eval_metrics.sync()
         return eval_metrics
@@ -270,6 +331,9 @@ def train_engine(config: dict):
             f"{_st['short']} shorter than the window ({_st['short_kept']} kept whole, {_st['short'] - _st['short_kept']} dropped), "
             f"{_st['no_window']} long enough but with no legal window."
         )
+        if "tags" in _st:
+            logger.info(f"Manifest epoch {epoch}: windows per tag {_st['tags']}, window-frames per tag {_st['window_frames']}, "
+                        f"candidates {_st['candidates']}, with replacement {_st['replacement']}.")
         # Train one epoch:
         train_metrics = train_one_epoch(
             accelerator=accelerator,
@@ -298,8 +362,17 @@ def train_engine(config: dict):
             multi_last_checkpoints=config["MULTI_LAST_CHECKPOINTS"],
             detr_freeze=detr_freeze,
             detr_frozen_autocast=config.get("DETR_FROZEN_AUTOCAST", "none"),
+            log_switch_stats=(
+                config.get("AUG_TRAJECTORY_SWITCH_PROB", 0.0) > 0.0
+                or config.get("AUG_TRAJECTORY_SWITCH_PROB_SCHEDULE") is not None
+            ),
+            rink_anchor=config.get("RINK_ANCHOR", False),
+            detr_cache=detr_cache,
         )
 
+        _cue_line = {k: round(float(train_metrics.metrics[k].global_average), 4) for k in list(train_metrics.metrics.keys()) if str(k).startswith("cue_")}
+        if _cue_line:
+            logger.info(f"CUE-CHECK epoch {epoch} (mean over the epoch): {_cue_line}")
         # Get learning rate:
         lr = optimizer.state_dict()["param_groups"][-1]["lr"]
         train_metrics["lr"].update(lr)
@@ -395,8 +468,15 @@ def train_one_epoch(
         # Frozen detector:
         detr_freeze: bool = False,
         detr_frozen_autocast: str = "none",
+        # Log the realised ID-switch statistics (swap rate, far-swap fraction, mean GIoU of swaps):
+        log_switch_stats: bool = False,
+        # Rink anchor: batch the per-frame projection inputs from the metas and pass them to prepare_for_motip:
+        rink_anchor: bool = False,
+        # DETR_CACHE_DIR: a utils.detr_cache.DetrCache of the frozen detector's outputs (skips the detector forward).
+        detr_cache=None,
 ):
     current_last_checkpoint_idx = 0
+    assert detr_cache is None or detr_freeze, "DETR_CACHE_DIR needs DETR_FREEZE: a trained detector's outputs change."
 
     model.train()
     if detr_freeze:
@@ -426,15 +506,16 @@ def train_one_epoch(
 
     for step, samples in enumerate(dataloader):
         images, annotations, metas = samples["images"], samples["annotations"], samples["metas"]
-        # Normalize the images:
-        # (Normally, it should be done in the dataloader, but here we do it in the training loop (on cuda).)
-        mean = [0.485, 0.456, 0.406]
-        std = [0.229, 0.224, 0.225]
-        images.tensors = v2.functional.to_dtype(images.tensors, dtype=torch.float32, scale=True)
-        images.tensors = v2.functional.normalize(images.tensors, mean=mean, std=std)
-        # A hack implementation to recover 0.0 in the masked regions:
-        images.tensors = images.tensors * (~images.mask[:, :, None, ...]).to(torch.float32)
-        images.tensors = images.tensors.contiguous()
+        if detr_cache is None:
+            # Normalize the images:
+            # (Normally, it should be done in the dataloader, but here we do it in the training loop (on cuda).)
+            mean = [0.485, 0.456, 0.406]
+            std = [0.229, 0.224, 0.225]
+            images.tensors = v2.functional.to_dtype(images.tensors, dtype=torch.float32, scale=True)
+            images.tensors = v2.functional.normalize(images.tensors, mean=mean, std=std)
+            # A hack implementation to recover 0.0 in the masked regions:
+            images.tensors = images.tensors * (~images.mask[:, :, None, ...]).to(torch.float32)
+            images.tensors = images.tensors.contiguous()
 
         # Learning rate warmup:
         if epoch < lr_warmup_epochs:
@@ -445,100 +526,107 @@ def train_one_epoch(
                 warmup_epochs=lr_warmup_epochs, num_iter_per_epoch=len(dataloader),
             )
 
-        _B, _T = len(annotations), len(annotations[0])
-        detr_num_train_frames = min(detr_num_train_frames, _T)
+        if detr_cache is None:
+            _B, _T = len(annotations), len(annotations[0])
+            detr_num_train_frames = min(detr_num_train_frames, _T)
 
-        # Prepare the DETR targets from the annotations:
-        detr_targets_flatten = annotations_to_flatten_detr_targets(annotations=annotations, device=device)
+            # Prepare the DETR targets from the annotations:
+            detr_targets_flatten = annotations_to_flatten_detr_targets(annotations=annotations, device=device)
 
-        # Select the training and no_grad frames:
-        random_frame_idxs = torch.randperm(_T, device=device)   # use these random indices to select the frames.
-        go_back_frame_idxs = torch.argsort(random_frame_idxs)   # use these indices to go back to the original order.
-        go_back_frame_idxs_flatten = torch.cat([
-            go_back_frame_idxs + _T * b for b in range(_B)
-        ])      # only used for the DETR's criterion.
-        # Split random_frame_idxs into training and no_grad frame indices:
-        detr_train_frame_idxs = random_frame_idxs[:detr_num_train_frames]
-        detr_no_grad_frame_idxs = random_frame_idxs[detr_num_train_frames:]
+            # Select the training and no_grad frames:
+            random_frame_idxs = torch.randperm(_T, device=device)   # use these random indices to select the frames.
+            go_back_frame_idxs = torch.argsort(random_frame_idxs)   # use these indices to go back to the original order.
+            go_back_frame_idxs_flatten = torch.cat([
+                go_back_frame_idxs + _T * b for b in range(_B)
+            ])      # only used for the DETR's criterion.
+            # Split random_frame_idxs into training and no_grad frame indices:
+            detr_train_frame_idxs = random_frame_idxs[:detr_num_train_frames]
+            detr_no_grad_frame_idxs = random_frame_idxs[detr_num_train_frames:]
 
-        detr_outputs_flatten_idxs = torch.arange(_B * _T, device=device)
-        detr_outputs_flatten_idxs = einops.rearrange(detr_outputs_flatten_idxs, "(b t) -> b t", b=_B)
-        detr_outputs_flatten_idxs = torch.cat([
-            einops.rearrange(detr_outputs_flatten_idxs[:, :detr_num_train_frames], "b t -> (b t)"),
-            einops.rearrange(detr_outputs_flatten_idxs[:, detr_num_train_frames:], "b t -> (b t)"),
-        ], dim=0)
-        detr_outputs_flatten_go_back_idxs = torch.argsort(detr_outputs_flatten_idxs)
-        pass
-        # Select the training and no_grad frames:
-        detr_train_frames = nested_tensor_index_select(images, dim=1, index=detr_train_frame_idxs)
-        detr_no_grad_frames = nested_tensor_index_select(images, dim=1, index=detr_no_grad_frame_idxs)
+            detr_outputs_flatten_idxs = torch.arange(_B * _T, device=device)
+            detr_outputs_flatten_idxs = einops.rearrange(detr_outputs_flatten_idxs, "(b t) -> b t", b=_B)
+            detr_outputs_flatten_idxs = torch.cat([
+                einops.rearrange(detr_outputs_flatten_idxs[:, :detr_num_train_frames], "b t -> (b t)"),
+                einops.rearrange(detr_outputs_flatten_idxs[:, detr_num_train_frames:], "b t -> (b t)"),
+            ], dim=0)
+            detr_outputs_flatten_go_back_idxs = torch.argsort(detr_outputs_flatten_idxs)
+            pass
+            # Select the training and no_grad frames:
+            detr_train_frames = nested_tensor_index_select(images, dim=1, index=detr_train_frame_idxs)
+            detr_no_grad_frames = nested_tensor_index_select(images, dim=1, index=detr_no_grad_frame_idxs)
 
-        # Prepare for the DETR forward function, turn the (B, T, ...) images to (B*T, ...) (or said flatten):
-        detr_train_frames.tensors = einops.rearrange(detr_train_frames.tensors, "b t c h w -> (b t) c h w").contiguous()
-        detr_train_frames.mask = einops.rearrange(detr_train_frames.mask, "b t h w -> (b t) h w").contiguous()
-        detr_no_grad_frames.tensors = einops.rearrange(detr_no_grad_frames.tensors, "b t c h w -> (b t) c h w").contiguous()
-        detr_no_grad_frames.mask = einops.rearrange(detr_no_grad_frames.mask, "b t h w -> (b t) h w").contiguous()
+            # Prepare for the DETR forward function, turn the (B, T, ...) images to (B*T, ...) (or said flatten):
+            detr_train_frames.tensors = einops.rearrange(detr_train_frames.tensors, "b t c h w -> (b t) c h w").contiguous()
+            detr_train_frames.mask = einops.rearrange(detr_train_frames.mask, "b t h w -> (b t) h w").contiguous()
+            detr_no_grad_frames.tensors = einops.rearrange(detr_no_grad_frames.tensors, "b t c h w -> (b t) c h w").contiguous()
+            detr_no_grad_frames.mask = einops.rearrange(detr_no_grad_frames.mask, "b t h w -> (b t) h w").contiguous()
 
-        # TODO: For DeNoise (e.g., in DINO-DETR),
-        #       need to split the detr_targets_flatten into training and no_grad parts.
+            # TODO: For DeNoise (e.g., in DINO-DETR),
+            #       need to split the detr_targets_flatten into training and no_grad parts.
 
-        # DETR forward:
-        # 1. no_grad frames:
-        if _T > detr_num_train_frames:      # do have no_grad frames (if not, skip this part)
-            _frozen_autocast = torch.autocast(device_type="cuda", dtype=_frozen_dtype) \
-                if (detr_freeze and _frozen_dtype is not None) else contextlib.nullcontext()
-            with torch.no_grad(), _frozen_autocast:
-                if detr_num_checkpoint_frames == 0 or detr_num_checkpoint_frames * 4 >= len(detr_no_grad_frames):
-                    # Directly forward the no_grad frames:
-                    detr_no_grad_outputs = model(frames=detr_no_grad_frames, part="detr")
+            # DETR forward:
+            # 1. no_grad frames:
+            if _T > detr_num_train_frames:      # do have no_grad frames (if not, skip this part)
+                _frozen_autocast = torch.autocast(device_type="cuda", dtype=_frozen_dtype) \
+                    if (detr_freeze and _frozen_dtype is not None) else contextlib.nullcontext()
+                with torch.no_grad(), _frozen_autocast:
+                    if detr_num_checkpoint_frames == 0 or detr_num_checkpoint_frames * 4 >= len(detr_no_grad_frames):
+                        # Directly forward the no_grad frames:
+                        detr_no_grad_outputs = model(frames=detr_no_grad_frames, part="detr")
+                    else:
+                        # Split the no_grad frames into batched iterations (reduce the memory usage):
+                        detr_no_grad_outputs = None
+                        for batch_samples in batch_iterator(
+                            detr_num_checkpoint_frames * 4,
+                            detr_no_grad_frames,
+                        ):
+                            batch_frames = batch_samples[0]
+                            _ = model(frames=batch_frames, part="detr")
+                            detr_no_grad_outputs = tensor_dict_cat(detr_no_grad_outputs, _, dim=0)
+            else:                               # no no_grad frames
+                detr_no_grad_outputs = None
+
+            # 2. training frames:
+            if detr_num_train_frames > 0:
+                if detr_num_checkpoint_frames == 0 or detr_num_checkpoint_frames >= len(detr_train_frames):
+                    # Directly forward the training frames:
+                    detr_train_outputs = model(frames=detr_train_frames, part="detr")
                 else:
-                    # Split the no_grad frames into batched iterations (reduce the memory usage):
-                    detr_no_grad_outputs = None
+                    # Split the training frames into batched iterations (reduce the memory usage):
+                    detr_train_outputs = None
                     for batch_samples in batch_iterator(
-                        detr_num_checkpoint_frames * 4,
-                        detr_no_grad_frames,
+                        detr_num_checkpoint_frames,
+                        detr_train_frames,
                     ):
                         batch_frames = batch_samples[0]
-                        _ = model(frames=batch_frames, part="detr")
-                        detr_no_grad_outputs = tensor_dict_cat(detr_no_grad_outputs, _, dim=0)
-        else:                               # no no_grad frames
-            detr_no_grad_outputs = None
-
-        # 2. training frames:
-        if detr_num_train_frames > 0:
-            if detr_num_checkpoint_frames == 0 or detr_num_checkpoint_frames >= len(detr_train_frames):
-                # Directly forward the training frames:
-                detr_train_outputs = model(frames=detr_train_frames, part="detr")
+                        _ = model(frames=batch_frames, part="detr", use_checkpoint=True)
+                        detr_train_outputs = tensor_dict_cat(detr_train_outputs, _, dim=0)
             else:
-                # Split the training frames into batched iterations (reduce the memory usage):
                 detr_train_outputs = None
-                for batch_samples in batch_iterator(
-                    detr_num_checkpoint_frames,
-                    detr_train_frames,
-                ):
-                    batch_frames = batch_samples[0]
-                    _ = model(frames=batch_frames, part="detr", use_checkpoint=True)
-                    detr_train_outputs = tensor_dict_cat(detr_train_outputs, _, dim=0)
+
+            # Combine training and no_grad outputs:
+            detr_outputs = tensor_dict_cat(detr_train_outputs, detr_no_grad_outputs, dim=0)
+            # Recover the order of the outputs:
+            detr_outputs = tensor_dict_index_select(detr_outputs, index=detr_outputs_flatten_go_back_idxs, dim=0)
+            detr_outputs = tensor_dict_index_select(detr_outputs, index=go_back_frame_idxs_flatten, dim=0)
+
+            # DETR criterion:
+            if detr_freeze:
+                # Frozen detector: no DETR losses, only the last-layer matching the ID loss needs.
+                if _frozen_dtype is not None:
+                    detr_outputs = tensor_dict_to_float32(detr_outputs)
+                detr_indices = detr_criterion.match_last_layer(
+                    outputs=detr_outputs, targets=detr_targets_flatten, batch_len=detr_criterion_batch_len,
+                )
+                detr_loss_dict = {}
+            else:
+                detr_loss_dict, detr_indices = detr_criterion(outputs=detr_outputs, targets=detr_targets_flatten, batch_len=detr_criterion_batch_len)
+
         else:
-            detr_train_outputs = None
-
-        # Combine training and no_grad outputs:
-        detr_outputs = tensor_dict_cat(detr_train_outputs, detr_no_grad_outputs, dim=0)
-        # Recover the order of the outputs:
-        detr_outputs = tensor_dict_index_select(detr_outputs, index=detr_outputs_flatten_go_back_idxs, dim=0)
-        detr_outputs = tensor_dict_index_select(detr_outputs, index=go_back_frame_idxs_flatten, dim=0)
-
-        # DETR criterion:
-        if detr_freeze:
-            # Frozen detector: no DETR losses, only the last-layer matching the ID loss needs.
-            if _frozen_dtype is not None:
-                detr_outputs = tensor_dict_to_float32(detr_outputs)
-            detr_indices = detr_criterion.match_last_layer(
-                outputs=detr_outputs, targets=detr_targets_flatten, batch_len=detr_criterion_batch_len,
-            )
+            # DETR_CACHE_DIR: the frozen detector's matched queries come from the cache (utils/detr_cache.py); the images
+            # are placeholders and no detector forward runs. Identity indices: row i is the query matched to GT object i.
+            detr_outputs, detr_indices = detr_cache.detr_outputs(metas, annotations, device)
             detr_loss_dict = {}
-        else:
-            detr_loss_dict, detr_indices = detr_criterion(outputs=detr_outputs, targets=detr_targets_flatten, batch_len=detr_criterion_batch_len)
 
         # Whether to only train the DETR, OR to train the MOTIP together:
         if not only_detr:
@@ -546,7 +634,12 @@ def train_one_epoch(
             # Need to prepare for MOTIP:
             seq_info = prepare_for_motip(
                 detr_outputs=detr_outputs, annotations=annotations, detr_indices=detr_indices,
+                with_gt_boxes=id_criterion.use_spatial_loss,
+                rink=rink_batch_from_metas(metas) if rink_anchor else None,
             )
+            if rink_anchor:
+                _tok_valid = torch.isfinite(seq_info["unknown_rink_xy"]).all(dim=-1)[~seq_info["unknown_masks"]]
+                metrics.update(name="rink_valid_frac", value=_tok_valid.float().mean().item() if _tok_valid.numel() else 1.0)
             seq_info = model(seq_info=seq_info, part="trajectory_modeling")
             id_logits, id_gts, id_masks = model(
                 seq_info=seq_info,
@@ -554,11 +647,29 @@ def train_one_epoch(
                 use_decoder_checkpoint=use_decoder_checkpoint,
             )
             id_loss = id_criterion(id_logits=id_logits, id_labels=id_gts, id_masks=id_masks)
+            if model_without_ddp.record_cue_stats:
+                for _k, _v in model_without_ddp.take_cue_stats().items():
+                    metrics.update(name=f"cue_{_k}", value=_v)
+            id_loss_parts = {}
+            if id_criterion.use_spatial_loss:
+                # MOTIP2 Spatial ID Loss, added to the CE (the CE itself is unchanged):
+                id_loss_parts["id_ce"] = id_loss
+                id_loss_parts["id_l1"], id_loss_parts["id_giou"] = id_criterion.spatial_loss(
+                    id_logits=id_logits,
+                    id_masks=id_masks,
+                    slot_labels=seq_info["trajectory_id_labels"],
+                    pred_boxes=seq_info["unknown_boxes"],
+                    gt_boxes=seq_info["unknown_gt_boxes"],
+                )
+                id_loss = id_loss \
+                    + id_criterion.l1_weight * id_loss_parts["id_l1"] \
+                    + id_criterion.giou_weight * id_loss_parts["id_giou"]
             _num_gts_per_frame = max(_num_gts_per_frame, id_gts.shape[-1])
             # print(f"Num of GTs per frame: {_num_gts_per_frame}")
             pass
         else:
             id_loss = None
+            id_loss_parts = {}
 
         # Backward:
         with accelerator.autocast():
@@ -573,8 +684,18 @@ def train_one_epoch(
             metrics.update(name="detr_loss", value=detr_loss.item())
             if id_loss is not None:
                 metrics.update(name="id_loss", value=id_loss.item())
+            for k, v in id_loss_parts.items():
+                metrics.update(name=k, value=v.item())
             for k, v in detr_loss_dict.items():
                 metrics.update(name=k, value=v.item())
+            if log_switch_stats:
+                _switch = empty_switch_stats()
+                for _clip in annotations:
+                    add_switch_stats(_switch, clip_switch_stats(_clip))
+                _switch = summarize_switch_stats(_switch)
+                metrics.update(name="switch_swap_rate", value=_switch["swap_rate"])
+                metrics.update(name="switch_far_frac", value=_switch["far_frac"])
+                metrics.update(name="switch_mean_giou", value=_switch["mean_giou"])
             loss /= accumulate_steps
             accelerator.backward(loss)  # use this line to replace loss.backward()
             if (step + 1) % accumulate_steps == 0:
@@ -736,8 +857,52 @@ def get_param_groups(model, config) -> list[dict]:
                 param_groups.append({"params": p, "lr": base_lr * dictionary_scale, "lr_scale": dictionary_scale})
                 dict_set.add(n)
 
+        # 4b. Spatial-anchor scale: own LR multiplier (a zero-init scale barely moves at a fine-tune LR), no WD.
+        anchor_set = set()
+        anchor_lr_scale = config.get("LR_ANCHOR_SCALE", 1.0)
+        for n, p in model.named_parameters():
+            if n.endswith("anchor_scale") and p.requires_grad:
+                param_groups.append({"params": p, "lr": base_lr * anchor_lr_scale, "lr_scale": anchor_lr_scale, "weight_decay": 0.0})
+                anchor_set.add(n)
+
+        # 4c. Rink anchor (new randomly initialised MLP + zero-init last layer): own LR multiplier; weights keep the
+        # base weight decay, biases and the "no position" embedding get none.
+        rink_set = set()
+        rink_lr_scale = config.get("LR_RINK_ANCHOR_SCALE", 1.0)
+        for n, p in model.named_parameters():
+            if n.startswith("rink_anchor.") and p.requires_grad:
+                group = {"params": p, "lr": base_lr * rink_lr_scale, "lr_scale": rink_lr_scale}
+                if n.endswith("bias") or n.endswith("no_position"):
+                    group["weight_decay"] = 0.0
+                param_groups.append(group)
+                rink_set.add(n)
+
+        # 4d. Team cue (new MLP + scalar gate + "missing" vector): own LR multiplier; weights keep the base weight decay,
+        # biases, the gate and the "missing" vector get none.
+        team_set = set()
+        team_lr_scale = config.get("LR_TEAM_CUE_SCALE", 1.0)
+        for n, p in model.named_parameters():
+            if n.startswith("team_cue.") and p.requires_grad:
+                group = {"params": p, "lr": base_lr * team_lr_scale, "lr_scale": team_lr_scale}
+                if n.endswith("bias") or n.endswith("missing") or n.endswith("gate"):
+                    group["weight_decay"] = 0.0
+                param_groups.append(group)
+                team_set.add(n)
+
+        # 4e. Look-ahead blocks of the ID decoder (zero-init output layers): own LR multiplier; biases, the time-bias table
+        # and the future-token ID offset get no weight decay.
+        la_set = set()
+        la_lr_scale = config.get("LR_LOOKAHEAD_SCALE", 1.0)
+        for n, p in model.named_parameters():
+            if ".lookahead." in n and p.requires_grad:
+                group = {"params": p, "lr": base_lr * la_lr_scale, "lr_scale": la_lr_scale}
+                if n.endswith("bias") or n.endswith("time_bias") or n.endswith("future_id_delta"):
+                    group["weight_decay"] = 0.0
+                param_groups.append(group)
+                la_set.add(n)
+
         # 5. Remaining params: full base LR
-        all_special = backbone_set | decoder_set | linproj_set | dict_set
+        all_special = backbone_set | decoder_set | linproj_set | dict_set | anchor_set | rink_set | team_set | la_set
         for n, p in model.named_parameters():
             if n not in all_special and p.requires_grad:
                 param_groups.append({"params": p, "lr": base_lr})
@@ -883,7 +1048,26 @@ def tensor_dict_index_select(tensor_dict, index, dim=0):
     return dict(res_tensor_dict)
 
 
-def prepare_for_motip(detr_outputs, annotations, detr_indices):
+def rink_batch_from_metas(metas) -> dict:
+    """The rink anchor's per-frame inputs from a batch's metas (B clips x T frames; see data/rink.py): ``H`` (B, T, 3, 3)
+    normalised augmented-image coords -> rink metres (NaN: frame has no homography), ``flip`` (B, T), ``bounds`` (B, T, 2).
+    Frames without the keys (a dataset with no rink sidecar) are all-NaN, so their tokens get the "no position" embedding."""
+    nan3, nan2 = np.full((3, 3), np.nan), np.full(2, np.nan)
+    return {
+        "H": torch.as_tensor(np.stack([[m.get("rink_Hn", nan3) for m in clip] for clip in metas]), dtype=torch.float64),
+        "flip": torch.as_tensor([[bool(m.get("rink_flip", False)) for m in clip] for clip in metas]),
+        "bounds": torch.as_tensor(np.stack([[m.get("rink_bounds", nan2) for m in clip] for clip in metas]), dtype=torch.float64),
+    }
+
+
+def prepare_for_motip(detr_outputs, annotations, detr_indices, with_gt_boxes: bool = False, rink: dict | None = None):
+    """``rink`` (from ``rink_batch_from_metas``) also returns ``{trajectory,unknown}_rink_xy`` (B, G, T, N, 2): each token's
+    feet in rink metres, projected from the *predicted* box of the detection it was built from with its own frame's
+    homography (so training sees the noise inference does); NaN where invalid.
+
+    ``with_gt_boxes`` also returns ``unknown_gt_boxes``: the GT box (cxcywh, normalised) of each slot's
+    object in the current frame (not of the detection a switched trajectory token was built from), which the
+    Spatial ID Loss compares the matched detections' predicted boxes against."""
     _B, _T = len(annotations), len(annotations[0])
     _G, _, _N = annotations[0][0]["trajectory_id_labels"].shape
     _device = detr_outputs["pred_logits"].device
@@ -899,12 +1083,20 @@ def prepare_for_motip(detr_outputs, annotations, detr_indices):
     unknown_masks = torch.ones((_B, _G, _T, _N), dtype=torch.bool, device=_device)
     unknown_boxes = torch.zeros((_B, _G, _T, _N, 4), dtype=torch.float32, device=_device)
     unknown_features = torch.zeros((_B, _G, _T, _N, _feature_dim), dtype=torch.float32, device=_device)
+    unknown_gt_boxes = torch.zeros((_B, _G, _T, _N, 4), dtype=torch.float32, device=_device)
+    _kit = detr_outputs.get("kit")      # TEAM_CUE: (B*T, Nmax, K) kit descriptors, same row order as the embeddings
+    if _kit is not None:
+        trajectory_kit = torch.full((_B, _G, _T, _N, _kit.shape[-1]), float("nan"), dtype=torch.float32, device=_device)
+        unknown_kit = torch.full((_B, _G, _T, _N, _kit.shape[-1]), float("nan"), dtype=torch.float32, device=_device)
     for b in range(_B):
         for t in range(_T):
             flatten_idx = b * _T + t
             go_back_detr_idxs = torch.argsort(detr_indices[flatten_idx][1])
             detr_output_embeds = detr_outputs["outputs"][flatten_idx][detr_indices[flatten_idx][0][go_back_detr_idxs]]
             detr_boxes = detr_outputs["pred_boxes"][flatten_idx][detr_indices[flatten_idx][0][go_back_detr_idxs]]
+            gt_boxes = annotations[b][t]["bbox"].to(_device)
+            if _kit is not None:
+                detr_kit = _kit[flatten_idx][detr_indices[flatten_idx][0][go_back_detr_idxs]]
             # detr_output_embeds = einops.repeat(detr_output_embeds, "n d -> g n d", g=_G)
             # detr_boxes = einops.repeat(detr_boxes, "n d -> g n d", g=_G)
             for group in range(_G):
@@ -923,9 +1115,14 @@ def prepare_for_motip(detr_outputs, annotations, detr_indices):
                 unknown_features[b, group, t, ~_curr_unk_masks] = detr_output_embeds[_curr_unk_ann_idxs[~_curr_unk_masks]]
                 trajectory_boxes[b, group, t, ~_curr_traj_masks] = detr_boxes[_curr_traj_ann_idxs[~_curr_traj_masks]]
                 unknown_boxes[b, group, t, ~_curr_unk_masks] = detr_boxes[_curr_unk_ann_idxs[~_curr_unk_masks]]
+                if _kit is not None:
+                    trajectory_kit[b, group, t, ~_curr_traj_masks] = detr_kit[_curr_traj_ann_idxs[~_curr_traj_masks]]
+                    unknown_kit[b, group, t, ~_curr_unk_masks] = detr_kit[_curr_unk_ann_idxs[~_curr_unk_masks]]
+                if with_gt_boxes:
+                    unknown_gt_boxes[b, group, t, ~_curr_unk_masks] = gt_boxes[_curr_unk_ann_idxs[~_curr_unk_masks]]
                 pass
             pass
-    return {
+    seq_info = {
         "trajectory_id_labels": trajectory_id_labels,
         "trajectory_times": trajectory_times,
         "trajectory_masks": trajectory_masks,
@@ -937,6 +1134,19 @@ def prepare_for_motip(detr_outputs, annotations, detr_indices):
         "unknown_boxes": unknown_boxes,
         "unknown_features": unknown_features,
     }
+    if with_gt_boxes:
+        seq_info["unknown_gt_boxes"] = unknown_gt_boxes
+    if _kit is not None:
+        seq_info["trajectory_kit"] = trajectory_kit
+        seq_info["unknown_kit"] = unknown_kit
+    if rink is not None:
+        from models.motip.rink_anchor import project_feet
+        _h = rink["H"].to(_device)[:, None, :, None]            # (B, 1, T, 1, 3, 3)
+        _flip = rink["flip"].to(_device)[:, None, :, None]       # (B, 1, T, 1)
+        _bounds = rink["bounds"].to(_device)[:, None, :, None]   # (B, 1, T, 1, 2)
+        seq_info["trajectory_rink_xy"] = project_feet(trajectory_boxes, _h, _flip, _bounds)
+        seq_info["unknown_rink_xy"] = project_feet(unknown_boxes, _h, _flip, _bounds)
+    return seq_info
 
 
 if __name__ == '__main__':

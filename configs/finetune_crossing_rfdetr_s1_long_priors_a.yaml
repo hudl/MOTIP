@@ -1,0 +1,14 @@
+# MOTIP2 spatial-priors ablation, arm A: spatial ID switches.
+# Identical to finetune_crossing_rfdetr_s1_long.yaml (frozen RF-DETR, from v1 crossing checkpoint_12, s1_long,
+# per-epoch val) except for the keys below. Arms: A = spatial switches; B = A + spatial ID loss; C = B + spatial anchor.
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_s1_long.yaml
+
+# Spatial ID switches (data/transforms.py): swap trajectory IDs between overlapping boxes only.
+# PROB 1.0 is the most the paper's sigma 0.5 can give: ~3.5% of visible objects get swapped (77% of those overlap),
+# measured with scripts/measure_switch_stats.py on s1_long. Reaching ~10% needs sigma ~0.7, at which ~70% of the swaps
+# are between non-overlapping boxes, so sigma stays at the paper's 0.5. See the 2026-11-18 session note.
+AUG_TRAJECTORY_SWITCH_PROB: 1.0
+AUG_TRAJECTORY_SWITCH_MODE: spatial
+AUG_TRAJECTORY_SWITCH_SIGMA: 0.5
+
+EXP_NAME: rfdetr_crossing_finetune_s1_long_priors_a

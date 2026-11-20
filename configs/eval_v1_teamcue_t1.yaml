@@ -1,0 +1,3 @@
+# Team-cue arm t1 (v1 lineage, REL_PE_LENGTH 60, MISS_TOLERANCE 60): kit descriptors from kit_motip_detr_t03.pt.
+SUPER_CONFIG_PATH: ./configs/eval_stage2_rfdetr_hockey.yaml
+TEAM_CUE: True

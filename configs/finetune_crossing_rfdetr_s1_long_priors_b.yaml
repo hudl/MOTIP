@@ -1,0 +1,10 @@
+# MOTIP2 spatial-priors ablation, arm B: arm A (spatial ID switches) + spatial ID loss.
+# Everything else is as finetune_crossing_rfdetr_s1_long.yaml. See finetune_crossing_rfdetr_s1_long_priors_a.yaml.
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_s1_long_priors_a.yaml
+
+# Spatial ID loss (models/motip/id_criterion.py): CE + 5 * L1 + 2 * (1 - GIoU), averaged over the ID distribution.
+ID_LOSS_SPATIAL: True
+ID_LOSS_L1_WEIGHT: 5.0
+ID_LOSS_GIOU_WEIGHT: 2.0
+
+EXP_NAME: rfdetr_crossing_finetune_s1_long_priors_b

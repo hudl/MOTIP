@@ -1,0 +1,5 @@
+# Look-ahead ID decoder, CONTROL arm: finetune_lookahead_l8.yaml with LOOKAHEAD_MAX_STEPS 0, i.e. the same recipe, the same
+# augmentations and the same (extra) blocks, which only ever see the frame-t detections (lag 0). Isolates the future tokens.
+SUPER_CONFIG_PATH: ./configs/finetune_lookahead_l8.yaml
+EXP_NAME: rfdetr_lookahead_ctrl
+LOOKAHEAD_MAX_STEPS: 0

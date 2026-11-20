@@ -12,6 +12,8 @@ def build_dataset(config: dict):
     start_frame_fraction = config.get("START_FRAME_FRACTION", 1.0)
     if start_frame_fraction < 1.0:
         dataset_kwargs["STADTracking"] = {"start_frame_fraction": start_frame_fraction}
+    if config.get("RINK_ANCHOR", False):
+        dataset_kwargs["Hockey"] = {"load_rink": True}
     return JointDataset(
         data_root=config["DATA_ROOT"],
         datasets=config["DATASETS"],
@@ -19,6 +21,8 @@ def build_dataset(config: dict):
         transforms=build_transforms(config),
         size_divisibility=config.get("SIZE_DIVISIBILITY", 0),
         dataset_kwargs=dataset_kwargs,
+        rink_anchor=config.get("RINK_ANCHOR", False),
+        detr_cache=bool(config.get("DETR_CACHE_DIR")),
     )
 
 

@@ -1,0 +1,16 @@
+# MOTIP2 spatial-priors ablation, arm C: arm B (spatial ID switches + spatial ID loss) + spatial anchor.
+# Everything else is as finetune_crossing_rfdetr_s1_long.yaml. See finetune_crossing_rfdetr_s1_long_priors_a.yaml.
+# Inference with this checkpoint needs SPATIAL_ANCHOR: True in the eval config (the anchor adds no parameters,
+# so the checkpoint loads either way; only the flag tells the model to apply it).
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_s1_long_priors_b.yaml
+
+# Spatial anchor (models/motip/motip.py): RF-DETR's box positional encoding is added to the feature half of every
+# ID-decoder token. The encoding head is the (frozen, DETR_FREEZE) ref_point_head of the detector.
+SPATIAL_ANCHOR: True
+# Learnable per-channel anchor scale initialised at 0: step 0 is exactly the checkpoint (the unscaled anchor
+# raised the ID CE ~4x at step 0 in the smoke test). The scale gets 100x the base LR (2e-3) so it can move
+# within 13 epochs at the fine-tune LR.
+SPATIAL_ANCHOR_SCALE_INIT: 0.0
+LR_ANCHOR_SCALE: 100.0
+
+EXP_NAME: rfdetr_crossing_finetune_s1_long_priors_c

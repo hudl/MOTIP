@@ -1,0 +1,10 @@
+# Team-cue ablation, arm T2 = T1 + the box (image-space) position anchor: RF-DETR's box positional encoding (the detector's frozen
+# ref_point_head) is added to the feature half of every token, with a learnable per-channel scale that starts at SPATIAL_ANCHOR_SCALE_INIT
+# (NOT 0: the earlier anchors started at 0 with a 2e-5 LR and ended at 0.4% of the feature size) and its own 25x LR group.
+# Rink XY is NOT in this arm: the v1 crossing dataset's source clips (golden_50) have no ihc-pipeline rink homographies.
+SUPER_CONFIG_PATH: ./configs/finetune_teamcue_t1.yaml
+EXP_NAME: rfdetr_teamcue_t2
+
+SPATIAL_ANCHOR: True
+SPATIAL_ANCHOR_SCALE_INIT: 0.3
+LR_ANCHOR_SCALE: 25.0

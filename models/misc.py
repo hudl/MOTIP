@@ -195,6 +195,16 @@ def load_checkpoint(model, path, states=None, optimizer=None, scheduler=None):
         return
     else:
         resize_rel_pos_embeds(model, model_state)
+        # SPATIAL_ANCHOR_SCALE_INIT adds `anchor_scale`; checkpoints trained without it keep the initial value.
+        # RINK_ANCHOR adds the `rink_anchor.*` parameters; likewise filled from the model's own (zero-init) values.
+        # TEAM_CUE adds `team_cue.*` (incl. the kit statistics buffers): filled from the model's own values.
+        _own = model.state_dict()
+        for _k in _own:
+            if (_k in ("anchor_scale", "module.anchor_scale")
+                    or _k.startswith(("rink_anchor.", "module.rink_anchor.", "team_cue.", "module.team_cue."))
+                    or ".lookahead." in _k) \
+                    and _k not in model_state:
+                model_state[_k] = _own[_k].clone()
         model.load_state_dict(model_state)
 
     if optimizer is not None:

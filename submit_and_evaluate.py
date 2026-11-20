@@ -100,6 +100,10 @@ def submit_and_evaluate(config: dict):
         else config["ONLY_DETR"],
         dtype=config.get("INFERENCE_DTYPE", "FP32"),
         max_tracks=config.get("MAX_TRACKS", 0),
+        spatial_gate=config.get("SPATIAL_GATE", False),
+        gate_base=config.get("GATE_BASE", 0.5),
+        gate_per_step=config.get("GATE_PER_STEP", 0.2),
+        rink_anchor=config.get("RINK_ANCHOR", False),
     )
 
     if metrics is not None:
@@ -139,12 +143,21 @@ def submit_and_evaluate_one_model(
         dtype: str = "FP32",
         max_tracks: int = 0,
         max_sequences: int | None = None,
+        spatial_gate: bool = False,
+        gate_base: float = 0.5,
+        gate_per_step: float = 0.2,
+        rink_anchor: bool = False,
 ):
     # Build the datasets:
+    # Rink anchor: the Hockey crossing datasets carry per-sequence homographies in <seq>/rink/ (data/rink.py); the
+    # tracker projects each predicted box's feet with its frame's homography. A sequence without them gets "no
+    # position" tokens (never a crash).
+    _dataset_extra = {"load_rink": True} if (rink_anchor and dataset == "Hockey") else {}
     inference_dataset = dataset_classes[dataset](
         data_root=data_root,
         split=data_split,
         load_annotation=False,
+        **_dataset_extra,
     )
     # Set the dtype during inference:
     match dtype:
@@ -207,6 +220,7 @@ def submit_and_evaluate_one_model(
         )
         # sequence_loader = accelerator.prepare(sequence_loader)
         sequence_wh = sequence_dataset.seq_hw()
+        _seq_rink = getattr(inference_dataset, "rink", {}).get(sequence_name) if rink_anchor else None
         runtime_tracker = RuntimeTracker(
             model=model,
             sequence_hw=sequence_wh,
@@ -220,7 +234,15 @@ def submit_and_evaluate_one_model(
             only_detr=inference_only_detr,
             dtype=dtype,
             max_tracks=max_tracks,
+            spatial_gate=spatial_gate,
+            gate_base=gate_base,
+            gate_per_step=gate_per_step,
+            rink_anchor=rink_anchor,
+            **({"rink_bounds_m": _seq_rink.bounds_m} if _seq_rink is not None else {}),
         )
+        if rink_anchor and _seq_rink is None:
+            logger.warning(f"RINK_ANCHOR: no rink homographies for sequence {sequence_name}; its tokens are invalid.",
+                           only_main=False)
         if is_fake:
             logger.info(
                 f"Fake submitting sequence {sequence_name} with {len(sequence_loader)} frames.",
@@ -232,6 +254,7 @@ def submit_and_evaluate_one_model(
             runtime_tracker=runtime_tracker,
             sequence_loader=sequence_loader,
             logger=logger,
+            rink=_seq_rink,
         )
         # Write the results to the submit file:
         if dataset in ["DanceTrack", "SportsMOT", "MOT17", "PersonPath22_Inference", "BFT", "Hockey", "AMFTracking"]:
@@ -380,6 +403,7 @@ def get_results_of_one_sequence(
         logger: Logger,
         runtime_tracker: RuntimeTracker,
         sequence_loader: DataLoader,
+        rink=None,
 ):
     tracker_results = []
     assert len(sequence_loader) > 10, "The sequence loader is too short."
@@ -389,7 +413,8 @@ def get_results_of_one_sequence(
         image.tensors = image.tensors.cuda()
         image.mask = image.mask.cuda()
         # image = nested_tensor_from_tensor_list(tensor_list=[image[0]])
-        runtime_tracker.update(image=image)
+        # rink (data.rink.SequenceRink): this frame's image -> rink matrix, for the rink anchor / gate.
+        runtime_tracker.update(image=image, rink_H=rink.frame_H(t) if rink is not None else None)
         _results = runtime_tracker.get_track_results()
         tracker_results.append(_results)
     fps = (len(sequence_loader) - 10) / (time.time() - begin_time)

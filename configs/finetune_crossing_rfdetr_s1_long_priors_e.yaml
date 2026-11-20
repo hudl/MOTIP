@@ -1,0 +1,20 @@
+# MOTIP2 spatial-priors ablation with the rink anchor, arm E: arm C (arm B + image spatial anchor with a zero-init scale)
+# + rink anchor. Everything else is as finetune_crossing_rfdetr_s1_long.yaml / arm C (the chain below).
+# Needs the rink sidecar of the dataset: <seq>/rink/{homography.jsonl,rink_meta.json} (add_rink_sidecar.py), also for the
+# val sequences (the per-epoch val runs the tracker with the anchor on and reads Hockey/val/<seq>/rink/).
+# Inference with this checkpoint needs SPATIAL_ANCHOR: True, SPATIAL_ANCHOR_SCALE_INIT: 0.0 and RINK_ANCHOR: True in the
+# eval config AND per-frame homographies for the clip (sip_tracking: MotipSegmentedTracker(rink_anchor=True, rink_dir=...)).
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_s1_long_priors_c.yaml
+
+# Rink anchor (models/motip/rink_anchor.py): each token's player position in rink metres (feet of its *predicted* box
+# projected with the frame's homography; augmentation inverted, x negated on a horizontal flip) -> Fourier features ->
+# MLP -> added to the detection-feature half of every trajectory / unknown token, independent of (and in addition to)
+# the image anchor above. The last MLP layer and the learned "no position" embedding start at zero, so step 0 is
+# exactly the checkpoint.
+RINK_ANCHOR: True
+# Per-token chance (training only) of replacing the position by the "no position" embedding.
+RINK_ANCHOR_DROPOUT: 0.1
+# The new MLP trains from random init at a fine-tune LR (2e-5): 20x base = 4e-4. Not tuned.
+LR_RINK_ANCHOR_SCALE: 20.0
+
+EXP_NAME: rfdetr_crossing_finetune_s1_long_priors_e

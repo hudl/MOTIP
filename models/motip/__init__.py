@@ -17,6 +17,79 @@ _RFDETR_REPO = os.path.join(
 )
 
 
+
+# --------------------------------------------------------------------------------------------------
+# Last-layer matching guard (RF-DETR). RF-DETR's HungarianMatcher replaces inf/nan costs with
+# `C.max() * 2`, but `C.max()` is NaN as soon as one entry is NaN, so a single degenerate box (GIoU 0/0)
+# makes linear_sum_assignment raise and kills the whole DDP job. These keep the match finite.
+# --------------------------------------------------------------------------------------------------
+MATCH_MIN_WH = 1e-4   # normalised; ~0.1 px at 1920 wide, far below any real box
+MATCH_GUARD_STATS = {"calls": 0, "sanitized": 0, "fallback": 0}
+
+
+def sanitize_match_inputs(single: dict, targets: list) -> tuple[dict, list, bool]:
+    """Finite logits/boxes and boxes with a minimum w/h. Returns (single, targets, changed)."""
+    import torch
+    changed = False
+    out = {}
+    for k, v in single.items():
+        if not torch.isfinite(v).all():
+            v = torch.nan_to_num(v, nan=0.0, posinf=1e4, neginf=-1e4)
+            changed = True
+        out[k] = v
+    b = out["pred_boxes"]
+    if (b[..., 2:] < MATCH_MIN_WH).any():
+        b = b.clone()
+        b[..., 2:] = b[..., 2:].clamp(min=MATCH_MIN_WH)
+        out["pred_boxes"] = b
+        changed = True
+    new_targets = []
+    for t in targets:
+        tb = t["boxes"]
+        if tb.numel() and ((tb[..., 2:] < MATCH_MIN_WH).any() or not torch.isfinite(tb).all()):
+            tb = torch.nan_to_num(tb, nan=0.5, posinf=1.0, neginf=0.0).clone()
+            tb[..., 2:] = tb[..., 2:].clamp(min=MATCH_MIN_WH)
+            t = {**t, "boxes": tb}
+            changed = True
+        new_targets.append(t)
+    return out, new_targets, changed
+
+
+def l1_fallback_match(single: dict, targets: list) -> list:
+    """Hungarian on finite L1 box cost only, the same (pred_idx, tgt_idx) format as the RF-DETR matcher."""
+    import torch
+    from scipy.optimize import linear_sum_assignment
+    res = []
+    boxes = single["pred_boxes"]
+    for i, t in enumerate(targets):
+        tb = t["boxes"]
+        if tb.numel() == 0:
+            e = torch.as_tensor([], dtype=torch.int64)
+            res.append((e, e.clone()))
+            continue
+        c = torch.cdist(boxes[i].float(), tb.float(), p=1)
+        c = torch.nan_to_num(c, nan=1e6, posinf=1e6, neginf=1e6).cpu().numpy()
+        r, k = linear_sum_assignment(c)
+        res.append((torch.as_tensor(r, dtype=torch.int64), torch.as_tensor(k, dtype=torch.int64)))
+    return res
+
+
+def guarded_match(matcher, single: dict, targets: list) -> list:
+    """matcher(single, targets) on sanitised inputs; L1 fallback if it still fails. Never raises on NaN."""
+    import torch
+    MATCH_GUARD_STATS["calls"] += 1
+    single, targets, changed = sanitize_match_inputs(single, targets)
+    if changed:
+        MATCH_GUARD_STATS["sanitized"] += 1
+    try:
+        with torch.no_grad():
+            return matcher(single, targets)
+    except ValueError:
+        MATCH_GUARD_STATS["fallback"] += 1
+        with torch.no_grad():
+            return l1_fallback_match(single, targets)
+
+
 def _build_rf_detr(config, detr_args):
     """Build an LWDETR model and return (model, criterion).
 
@@ -199,8 +272,7 @@ def _build_rf_detr(config, detr_args):
                 "pred_logits": outputs["pred_logits"][:, :self._num_queries, :],
                 "pred_boxes":  outputs["pred_boxes"][:, :self._num_queries, :],
             }
-            with _torch.no_grad():
-                return self._c.matcher(single, targets)
+            return guarded_match(self._c.matcher, single, targets)
 
         def train(self, mode=True):
             self._c.train(mode)
@@ -283,7 +355,15 @@ def build(config: dict):
         rel_pe_length=config["REL_PE_LENGTH"],
         use_aux_loss=config["USE_AUX_LOSS"],
         use_shared_aux_head=config["USE_SHARED_AUX_HEAD"],
+        # Look-ahead ID decoder (models/motip/lookahead.py), off by default.
+        lookahead=dict(
+            max_steps=int(config.get("LOOKAHEAD_MAX_STEPS", 8)),
+            layers=config.get("LOOKAHEAD_LAYERS", None),
+            geo_hidden=int(config.get("LOOKAHEAD_GEO_HIDDEN", 32)),
+        ) if config.get("LOOKAHEAD", False) else None,
     ) if config["ONLY_DETR"] is False else None
+    if config.get("LOOKAHEAD", False) and (config.get("RINK_ANCHOR", False) or config.get("TEAM_CUE", False)):
+        raise NotImplementedError("LOOKAHEAD does not carry rink XY / kit descriptors for future tokens yet.")
 
     # Construct MOTIP model:
     motip_model = MOTIP(
@@ -292,6 +372,24 @@ def build(config: dict):
         only_detr=config["ONLY_DETR"],
         trajectory_modeling=_trajectory_modeling,
         id_decoder=_id_decoder,
+        spatial_anchor=config.get("SPATIAL_ANCHOR", False),
+        spatial_anchor_scale_init=config.get("SPATIAL_ANCHOR_SCALE_INIT", None),
+        detr_hidden_dim=config["DETR_HIDDEN_DIM"],
+        rink_anchor=config.get("RINK_ANCHOR", False),
+        rink_anchor_kwargs=dict(
+            dropout=config.get("RINK_ANCHOR_DROPOUT", 0.0),
+            n_freq=config.get("RINK_ANCHOR_N_FREQ", 24),
+            min_period_m=config.get("RINK_ANCHOR_MIN_PERIOD_M", 1.0),
+            max_period_m=config.get("RINK_ANCHOR_MAX_PERIOD_M", 64.0),
+        ),
+        team_cue=config.get("TEAM_CUE", False),
+        team_cue_kwargs=dict(
+            in_dim=config.get("TEAM_CUE_DIM", 14),
+            hidden=config.get("TEAM_CUE_HIDDEN", 128),
+            gate_init=config.get("TEAM_CUE_GATE_INIT", 0.25),
+            dropout=config.get("TEAM_CUE_DROPOUT", 0.1),
+            noise_std=config.get("TEAM_CUE_NOISE", 0.0),
+        ),
     )
     # Store num_classes so RuntimeTracker can slice logits to the real class
     # channels (RF-DETR's build_model adds +1 for the background slot).

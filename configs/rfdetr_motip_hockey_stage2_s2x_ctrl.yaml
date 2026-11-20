@@ -1,0 +1,5 @@
+# RF-DETR MOTIP stage 2 on motip_hockey_data (hard windows, ~1,203 sequences), CONTROL arm of the priors pair: the existing
+# recipe unchanged (rfdetr_motip_hockey_stage2.yaml: LR 5e-5, 13 epochs, SAMPLE_LENGTHS 60, uniform ID switches p=0.5,
+# occlusion p=0.5, detector + ID decoder jointly from the stage-1 detector rfdetr_best_ema.pth via --detr-pretrain).
+SUPER_CONFIG_PATH: ./configs/rfdetr_motip_hockey_stage2.yaml
+EXP_NAME: rfdetr_motip_hockey_stage2_s2x_ctrl

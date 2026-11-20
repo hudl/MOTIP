@@ -1,0 +1,8 @@
+# Priors arm c resumed from its own checkpoint_3.pth (end of epoch 3, with optimizer + scheduler state) after
+# the epoch-4 crash in RF-DETR's matcher (NaN cost). Identical recipe to arm c; RESUME_STATES keeps epoch/step,
+# so training continues at epoch 4. The matcher guard (models/motip/__init__.py guarded_match) prevents a repeat.
+# checkpoint_best.pth is chosen from the resumed epochs only (the epoch 0-3 best stays in the old job's output).
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_s1_long_priors_c.yaml
+RESUME_STATES: True
+EVAL_BEFORE_TRAIN: False
+EXP_NAME: rfdetr_crossing_finetune_s1_long_priors_c2

@@ -101,3 +101,21 @@ def generalized_box_iou(boxes1, boxes2):
     area = wh[:, :, 0] * wh[:, :, 1]
 
     return iou - (area - union) / area
+
+
+def pairwise_giou(boxes1: torch.Tensor, boxes2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """GIoU between every box of ``boxes1`` (..., N, 4) and ``boxes2`` (..., M, 4) -> (..., N, M).
+
+    Boxes are xyxy. Unlike ``generalized_box_iou`` this accepts leading batch dims and never asserts or
+    divides by zero (``eps`` keeps zero-area padding boxes finite), so it is safe on padded boxes.
+    """
+    a, b = boxes1[..., :, None, :], boxes2[..., None, :, :]
+    area_a = (a[..., 2] - a[..., 0]).clamp(min=0) * (a[..., 3] - a[..., 1]).clamp(min=0)
+    area_b = (b[..., 2] - b[..., 0]).clamp(min=0) * (b[..., 3] - b[..., 1]).clamp(min=0)
+    lt = torch.maximum(a[..., :2], b[..., :2])
+    rb = torch.minimum(a[..., 2:], b[..., 2:])
+    inter = (rb - lt).clamp(min=0).prod(-1)
+    union = area_a + area_b - inter
+    iou = inter / union.clamp(min=eps)
+    enc = (torch.maximum(a[..., 2:], b[..., 2:]) - torch.minimum(a[..., :2], b[..., :2])).clamp(min=0).prod(-1)
+    return iou - (enc - union) / enc.clamp(min=eps)

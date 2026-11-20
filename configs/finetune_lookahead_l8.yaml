@@ -1,0 +1,28 @@
+# Look-ahead ID decoder, arm L8 (models/motip/lookahead.py; session note 2026-11-20-lookahead-decoder.md).
+# The v1 crossing fine-tune recipe (finetune_crossing_rfdetr_v1.yaml: motip_crossing_dataset, stride 4, SAMPLE_LENGTHS 20,
+# LR 2e-5, 13 epochs, MILESTONES [10, 12], REL_PE 60) from the PRODUCTION checkpoint_12 (--resume-model), detector FROZEN with its
+# outputs read from the DETR cache (as the team-cue arms; only the trajectory FFN + ID decoder train), plus:
+#   - MOTIP2 spatial ID switches (p 1.0, sigma 0.5) and the crossing-contamination augmentation (p 0.5 per group, <= 5 steps);
+#   - LOOKAHEAD: per sample a lag K' ~ U{0..8} decoder steps (8 steps = 32 raw frames on this stride-4 data); blocks on layers 3-5.
+# The control arm (finetune_lookahead_ctrl.yaml) is this file with LOOKAHEAD_MAX_STEPS 0 (same blocks, never any future).
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_v1.yaml
+INFERENCE_DATASET:
+EXP_NAME: rfdetr_lookahead_l8
+
+DETR_FREEZE: True
+DETR_FROZEN_AUTOCAST: none
+DETR_CACHE_DIR: /opt/ml/input/data/cache
+
+AUG_TRAJECTORY_SWITCH_PROB: 1.0
+AUG_TRAJECTORY_SWITCH_MODE: spatial
+AUG_TRAJECTORY_SWITCH_SIGMA: 0.5
+AUG_TRAJECTORY_CONTAMINATE_PROB: 0.5
+AUG_TRAJECTORY_CONTAMINATE_MAX_LEN: 5
+AUG_TRAJECTORY_CONTAMINATE_IOU: 0.1
+
+LOOKAHEAD: True
+LOOKAHEAD_MAX_STEPS: 8
+LOOKAHEAD_LAYERS: [3, 4, 5]
+LOOKAHEAD_GEO_HIDDEN: 32
+# New zero-init blocks at 10x the fine-tune LR (2e-4); the rest of the ID decoder at 2e-5 as in v1.
+LR_LOOKAHEAD_SCALE: 10.0

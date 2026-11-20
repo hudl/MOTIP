@@ -1,0 +1,14 @@
+# Data-recipe study arm m50 (obsidian-vault/sessions/2026-11-20-motip-data-curation-audit.md): ID-head fine-tune of the
+# production checkpoint_12 with its detector FROZEN and read from the DETR cache, on the clean full-clip pool motip_pool_v1.
+# Windows come from SAMPLE_MANIFEST (data/manifest_sampler.py; written by scripts/data_prep/ice_hockey/make_window_manifest.py),
+# budget-matched to T0 (114,420 window-frames per epoch). Everything else = the v1 recipe (LR 2e-5, 13 epochs, REL_PE 60).
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_v1.yaml
+DATA_ROOT: /mnt/s3files/faceoff/tracking_workgroup/tracking_experiments/motip_pool_v1
+INFERENCE_DATASET:
+DETR_FREEZE: True
+DETR_FROZEN_AUTOCAST: none
+DETR_CACHE_DIR: /opt/ml/input/data/cache
+SAMPLE_MANIFEST: manifests/m50.json
+BATCH_SIZE: 1
+EXP_NAME: rfdetr_pool_m50
+DETR_CACHE_MAX_OPEN: 512   # keep the whole pool cache (~2 GB) in RAM, one copy per training process

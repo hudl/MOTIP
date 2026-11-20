@@ -1,0 +1,4 @@
+# Team-cue arm t2: t1 + image spatial anchor (initial scale 0.3; the trained scale is loaded from the checkpoint).
+SUPER_CONFIG_PATH: ./configs/eval_v1_teamcue_t1.yaml
+SPATIAL_ANCHOR: True
+SPATIAL_ANCHOR_SCALE_INIT: 0.3

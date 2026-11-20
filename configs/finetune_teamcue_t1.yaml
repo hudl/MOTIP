@@ -1,0 +1,14 @@
+# Team-cue ablation, arm T1 = T0 + team cue: every ID-decoder token (trajectory and current) gets TeamCue(kit descriptor) added to the
+# detection-feature half (models/motip/team_cue.py; descriptor: utils/kit_feature.py, 14 colour numbers of the torso / legs of the
+# detection box). Tokens without a descriptor get a learned "missing" vector; 10% of the others are replaced by it in training.
+# The added term starts at RMS ~0.25 per element (the detector features are ~0.9): it is NOT zero-initialised (the earlier anchors were,
+# and stayed at ~0.3-1% of the feature size). Own LR group: 25 x the base LR.
+SUPER_CONFIG_PATH: ./configs/finetune_teamcue_t0.yaml
+EXP_NAME: rfdetr_teamcue_t1
+
+TEAM_CUE: True
+TEAM_CUE_DIM: 14
+TEAM_CUE_HIDDEN: 128
+TEAM_CUE_GATE_INIT: 0.25
+TEAM_CUE_DROPOUT: 0.1
+LR_TEAM_CUE_SCALE: 25.0

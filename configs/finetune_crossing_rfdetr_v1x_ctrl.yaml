@@ -1,0 +1,10 @@
+# v1 crossing fine-tune (the production recipe: finetune_crossing_rfdetr_v1.yaml), CONTROL arm of the priors pair.
+# Stride-4 crossing windows (motip_crossing_dataset, built from golden_50 clips), SAMPLE_LENGTHS 20, intervals 4, LR 2e-5, 13 epochs,
+# detector + ID decoder trained jointly, resumed from the RF-DETR stage-2 hockey checkpoint_5 (--resume-model).
+# Differences from finetune_crossing_rfdetr_v1.yaml: none in the recipe; (a) no in-training validation (INFERENCE_DATASET unset:
+# checkpoints are selected on the full-clip split with scripts/k8s_eval/select_checkpoints.py), (b) the optimizer / scheduler are
+# really NOT resumed any more (--resume-optimizer false used to be parsed as truthy: production ckpt_12 continued the stage-2 LR
+# schedule; see the 2026-09-30 note), so this arm is NOT a bit-for-bit rerun of ckpt_12; compare the two arms of the pair to each other.
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_v1.yaml
+INFERENCE_DATASET:
+EXP_NAME: rfdetr_crossing_finetune_v1x_ctrl

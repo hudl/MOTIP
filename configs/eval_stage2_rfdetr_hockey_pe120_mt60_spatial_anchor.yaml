@@ -1,0 +1,4 @@
+# REL_PE_LENGTH-120 checkpoints with the image spatial anchor (priors arms c/c2/e), at the 60-frame tracker memory.
+SUPER_CONFIG_PATH: ./configs/eval_stage2_rfdetr_hockey_pe120_mt60.yaml
+SPATIAL_ANCHOR: True
+SPATIAL_ANCHOR_SCALE_INIT: 0.0

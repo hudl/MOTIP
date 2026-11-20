@@ -11,8 +11,14 @@ from math import floor
 from PIL import Image
 from triton.language import dtype
 
-from utils.box_ops import box_xywh_to_xyxy, box_xyxy_to_cxcywh
+from scipy.optimize import linear_sum_assignment
+
+from utils.box_ops import box_xywh_to_xyxy, box_xyxy_to_cxcywh, box_cxcywh_to_xyxy, pairwise_giou
 from .util import is_legal
+from . import rink as _rink
+
+# How the trajectory ID-switch augmentation picks the objects whose IDs are exchanged:
+SWITCH_MODES = ("uniform", "spatial")
 
 
 class MultiIdentity:
@@ -147,8 +153,11 @@ class MultiBoxXYXYtoCXCYWH:
 
 
 class MultiRandomHorizontalFlip:
-    def __init__(self, p=0.5):
+    def __init__(self, p=0.5, record_flip: bool = False):
         self.p = p
+        # DETR_CACHE_DIR: the cached detector outputs are of the unflipped frame; the training loop flips their boxes
+        # when ``meta["detr_flip"]`` is set (utils/detr_cache.py). Off by default: no new meta key.
+        self.record_flip = record_flip
 
     def __call__(self, images, annotations, metas):
         # Here, the boxes in annotations are in the format of (x1, y1, x2, y2).
@@ -167,6 +176,10 @@ class MultiRandomHorizontalFlip:
                     * torch.as_tensor([-1, 1, -1, 1])
                     + torch.as_tensor([w, 0, w, 0])
                 )
+            _rink.apply_aug(metas, _rink.aug_flip)      # rink anchor bookkeeping (no-op when it is off)
+            if self.record_flip:
+                for meta in metas:
+                    meta["detr_flip"] = True
         return images, annotations, metas
 
 
@@ -220,6 +233,7 @@ class MultiRandomResize:
         # Resize annotations:
         for annotation in annotations:
             annotation["bbox"] = annotation["bbox"] * torch.as_tensor([scale_ratio_x, scale_ratio_y] * 2)
+        _rink.apply_aug(metas, _rink.aug_resize, new_hw[1], new_hw[0])
         return images, annotations, metas
 
 
@@ -276,6 +290,7 @@ class MultiRandomCrop:
             else:
                 raise NotImplementedError(f"The input image type {type(images)} is not supported.")
             annotations = _annotations
+            _rink.apply_aug(metas, _rink.aug_crop, _i, _j, _h, _w)
             return images, annotations, metas
 
 
@@ -369,6 +384,16 @@ class MultiNormalize:
         for annotation in annotations:
             annotation["bbox"] = annotation["bbox"] / torch.tensor([w, h, w, h])
         return images.contiguous(), annotations, metas
+
+
+class MultiRinkFinalize:
+    """Rink anchor: turn the tracked augmentation (``metas[i]['rink_aug']``) and the frame's image -> rink matrix
+    (``metas[i]['rink_H']``) into ``rink_Hn`` (normalised augmented-image coords -> metres), ``rink_flip``."""
+    def __call__(self, images, annotations, metas):
+        for meta in metas:
+            if "rink_aug" in meta:
+                _rink.finalize_meta(meta)
+        return images, annotations, metas
 
 
 class MultiNormalizeBoundingBoxes:
@@ -469,10 +494,28 @@ class TurnIntoTrajectoryAndUnknown:
             num_id_vocabulary: int,
             aug_trajectory_occlusion_prob: float,
             aug_trajectory_switch_prob: float,
+            aug_trajectory_switch_mode: str = "uniform",
+            aug_trajectory_switch_sigma: float = 0.5,
+            aug_trajectory_contaminate_prob: float = 0.0,
+            aug_trajectory_contaminate_max_len: int = 5,
+            aug_trajectory_contaminate_iou: float = 0.1,
     ):
+        if aug_trajectory_switch_mode not in SWITCH_MODES:
+            raise ValueError(
+                f"AUG_TRAJECTORY_SWITCH_MODE must be one of {SWITCH_MODES}, not {aug_trajectory_switch_mode!r}."
+            )
         self.num_id_vocabulary = num_id_vocabulary
         self.aug_trajectory_occlusion_prob = aug_trajectory_occlusion_prob
         self.aug_trajectory_switch_prob = aug_trajectory_switch_prob
+        self.aug_trajectory_switch_mode = aug_trajectory_switch_mode
+        self.aug_trajectory_switch_sigma = aug_trajectory_switch_sigma
+        # Crossing contamination (default off, see _contaminate): a run of a victim's history tokens built from an
+        # overlapping player's detection, as when the visible player's detection takes the hidden player's ID.
+        if not 0.0 <= aug_trajectory_contaminate_prob <= 1.0 or int(aug_trajectory_contaminate_max_len) < 1:
+            raise ValueError("need 0 <= AUG_TRAJECTORY_CONTAMINATE_PROB <= 1 and AUG_TRAJECTORY_CONTAMINATE_MAX_LEN >= 1")
+        self.aug_trajectory_contaminate_prob = float(aug_trajectory_contaminate_prob)
+        self.aug_trajectory_contaminate_max_len = int(aug_trajectory_contaminate_max_len)
+        self.aug_trajectory_contaminate_iou = float(aug_trajectory_contaminate_iou)
         return
 
     def __call__(self, images, annotations, metas):
@@ -522,7 +565,12 @@ class TurnIntoTrajectoryAndUnknown:
             trajectory_id_masks = einops.rearrange(trajectory_id_masks, "(G N) T -> G T N", G=_G, N=_N)
             unknown_id_masks = einops.rearrange(unknown_id_masks, "(G N) T -> G T N", G=_G, N=_N)
 
-        if self.aug_trajectory_switch_prob > 0.0:
+        if self.aug_trajectory_switch_prob > 0.0 and self.aug_trajectory_switch_mode == "spatial":
+            # MOTIP2 Spatial ID Switches (see _spatial_switch):
+            trajectory_ann_idxs, trajectory_id_masks = self._spatial_switch(
+                annotations, trajectory_ann_idxs, trajectory_id_masks,
+            )
+        elif self.aug_trajectory_switch_prob > 0.0:
             # Make trajectory switch:
             # 1. Turn the shape into (_G * _T, _N):
             trajectory_id_labels = einops.rearrange(trajectory_id_labels, "G T N -> (G T) N")
@@ -546,6 +594,11 @@ class TurnIntoTrajectoryAndUnknown:
             trajectory_id_masks = einops.rearrange(trajectory_id_masks, "(G T) N -> G T N", G=_G, T=_T)
             trajectory_ann_idxs = einops.rearrange(trajectory_ann_idxs, "(G T) N -> G T N", G=_G, T=_T)
             pass
+
+        if self.aug_trajectory_contaminate_prob > 0.0:
+            trajectory_ann_idxs, trajectory_id_masks = self._contaminate(
+                annotations, trajectory_ann_idxs, trajectory_id_masks,
+            )
 
         # Check all ID labels are legal:
         assert torch.all(trajectory_id_labels >= 0)
@@ -588,10 +641,140 @@ class TurnIntoTrajectoryAndUnknown:
 
         return images, annotations, metas
 
+    def _spatial_switch(self, annotations, ann_idxs, id_masks):
+        """MOTIP2 Spatial ID Switches: ID confusion between objects that are close in the image.
+
+        In every (group, frame), each visible object is selected with probability
+        ``aug_trajectory_switch_prob``; the selected objects are then permuted among themselves by Hungarian
+        matching on ``GIoU(box_i, box_j) + N(0, sigma^2)`` (maximised), so an object mostly keeps its own
+        detection or trades it with an overlapping one. As in the uniform branch, switching means permuting
+        the ``ann_idxs`` (which detection a slot's trajectory token is built from) and the ``id_masks``
+        between the selected slots. Only visible slots are selected, so the masks do not change here.
+
+        Args:
+            ann_idxs, id_masks: the trajectory ones, (G, T, N).
+        Returns:
+            The new ``(ann_idxs, id_masks)``; the inputs are not modified.
+        """
+        ann_idxs, id_masks = ann_idxs.clone(), id_masks.clone()
+        src_ann_idxs, src_id_masks = ann_idxs.clone(), id_masks.clone()
+        _G, _T, _N = ann_idxs.shape
+        for t in range(_T):
+            boxes = box_cxcywh_to_xyxy(annotations[t]["bbox"].float())
+            for g in range(_G):
+                visible = (~src_id_masks[g, t]) & (src_ann_idxs[g, t] >= 0)
+                selected = visible & (torch.rand(_N) < self.aug_trajectory_switch_prob)
+                slots = torch.nonzero(selected)[:, 0]
+                if len(slots) < 2:      # nothing to switch with
+                    continue
+                src = src_ann_idxs[g, t, slots]
+                _boxes = boxes[src]
+                affinity = pairwise_giou(_boxes, _boxes) \
+                    + self.aug_trajectory_switch_sigma * torch.randn(len(slots), len(slots))
+                rows, cols = linear_sum_assignment(-affinity.numpy())
+                rows, cols = torch.as_tensor(rows), torch.as_tensor(cols)
+                ann_idxs[g, t, slots[rows]] = src_ann_idxs[g, t, slots[cols]]
+                id_masks[g, t, slots[rows]] = src_id_masks[g, t, slots[cols]]
+        return ann_idxs, id_masks
+
+    def _contaminate(self, annotations, ann_idxs, id_masks):
+        """Crossing contamination of the history (the realistic version of an ID switch at a crossing).
+
+        Per group, with probability ``aug_trajectory_contaminate_prob``: pick a random (frame t0, players a, b) with both
+        visible at t0, both seen at an earlier frame of the window, and box IoU > ``aug_trajectory_contaminate_iou``;
+        for d ~ U{1..max_len} frames from t0 (while both stay visible) the victim b's trajectory token is built from a's
+        detection, and a's own token is (p 0.5) missing ("steal": the visible player's detection took the hidden
+        player's ID), (p 0.3) b's detection ("swap" of the two for d frames) or (p 0.2) kept ("duplicate"). Only the
+        trajectory side changes: the unknown tokens and their labels stay the ground truth, so the decoder learns to
+        label the right player even when the latest tokens of his track are another player's.
+        Returns the new ``(ann_idxs, id_masks)``; the inputs are not modified."""
+        ann_idxs, id_masks = ann_idxs.clone(), id_masks.clone()
+        src_ann, src_masks = ann_idxs.clone(), id_masks.clone()
+        _G, _T, _N = ann_idxs.shape
+        boxes = [box_cxcywh_to_xyxy(annotations[t]["bbox"].float()) for t in range(_T)]
+        for g in range(_G):
+            if random.random() >= self.aug_trajectory_contaminate_prob:
+                continue
+            visible = (~src_masks[g]) & (src_ann[g] >= 0)                       # (T, N)
+            seen_before = torch.cumsum(visible.int(), dim=0) - visible.int() > 0  # seen at an earlier frame
+            cands = []
+            for t in range(1, _T):
+                slots = torch.nonzero(visible[t] & seen_before[t])[:, 0]
+                if len(slots) < 2:
+                    continue
+                b = boxes[t][src_ann[g, t, slots]]
+                iou = box_iou_matrix(b, b)
+                ii, jj = torch.nonzero(torch.triu(iou > self.aug_trajectory_contaminate_iou, diagonal=1), as_tuple=True)
+                cands += [(t, int(slots[i]), int(slots[j])) for i, j in zip(ii.tolist(), jj.tolist())]
+            if not cands:
+                continue
+            t0, a, b = cands[random.randrange(len(cands))]
+            if random.random() < 0.5:
+                a, b = b, a                                                    # b = the victim
+            d = random.randint(1, self.aug_trajectory_contaminate_max_len)
+            r = random.random()
+            mode = "steal" if r < 0.5 else ("swap" if r < 0.8 else "duplicate")
+            for t in range(t0, min(_T, t0 + d)):
+                if not (visible[t, a] and visible[t, b]):
+                    break
+                ann_idxs[g, t, b] = src_ann[g, t, a]
+                if mode == "steal":
+                    id_masks[g, t, a] = True
+                elif mode == "swap":
+                    ann_idxs[g, t, a] = src_ann[g, t, b]
+        return ann_idxs, id_masks
+
+
+def box_iou_matrix(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """(n, 4) x (m, 4) xyxy -> (n, m) IoU."""
+    lt = torch.maximum(a[:, None, :2], b[None, :, :2])
+    rb = torch.minimum(a[:, None, 2:], b[None, :, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]
+    area_a = (a[:, 2] - a[:, 0]).clamp(min=0) * (a[:, 3] - a[:, 1]).clamp(min=0)
+    area_b = (b[:, 2] - b[:, 0]).clamp(min=0) * (b[:, 3] - b[:, 1]).clamp(min=0)
+    return inter / (area_a[:, None] + area_b[None, :] - inter).clamp(min=1e-8)
+
+
+def build_cached_transforms(config: dict):
+    """Transforms for ``DETR_CACHE_DIR`` training: the detector outputs are cached for the original frame, so the only
+    image-space augmentation that can still be applied is the horizontal flip (``DETR_CACHE_FLIP``, on its boxes); the
+    images are tiny placeholders (see JointDataset). Resize / crop / colour jitter are dropped: the normalised boxes do not
+    change under an aspect-preserving resize, and a crop or a colour change would need a detector forward."""
+    _rink_finalize = [MultiRinkFinalize()] if config.get("RINK_ANCHOR", False) else []
+    return MultiCompose([
+        MultiBoxXYWHtoXYXY(),
+        MultiStack(),
+        MultiRandomHorizontalFlip(p=0.5 if config.get("DETR_CACHE_FLIP", False) else 0.0, record_flip=True),
+        MultiBoxXYXYtoCXCYWH(),
+        MultiToTensor(),
+        MultiStack(),
+        MultiNormalizeBoundingBoxes(),
+        *_rink_finalize,
+        GenerateIDLabels(
+            num_id_vocabulary=config["NUM_ID_VOCABULARY"],
+            aug_num_groups=config["AUG_NUM_GROUPS"],
+            num_training_ids=config.get("NUM_TRAINING_IDS", config["NUM_ID_VOCABULARY"]),
+        ),
+        TurnIntoTrajectoryAndUnknown(
+            num_id_vocabulary=config["NUM_ID_VOCABULARY"],
+            aug_trajectory_occlusion_prob=config["AUG_TRAJECTORY_OCCLUSION_PROB"],
+            aug_trajectory_switch_prob=config["AUG_TRAJECTORY_SWITCH_PROB"],
+            aug_trajectory_switch_mode=config.get("AUG_TRAJECTORY_SWITCH_MODE", "uniform"),
+            aug_trajectory_switch_sigma=config.get("AUG_TRAJECTORY_SWITCH_SIGMA", 0.5),
+            aug_trajectory_contaminate_prob=config.get("AUG_TRAJECTORY_CONTAMINATE_PROB", 0.0),
+            aug_trajectory_contaminate_max_len=config.get("AUG_TRAJECTORY_CONTAMINATE_MAX_LEN", 5),
+            aug_trajectory_contaminate_iou=config.get("AUG_TRAJECTORY_CONTAMINATE_IOU", 0.1),
+        ),
+    ])
+
 
 def build_transforms(config: dict):
+    if config.get("DETR_CACHE_DIR"):
+        return build_cached_transforms(config)
     # mean = [0.485, 0.456, 0.406]
     # std = [0.229, 0.224, 0.225]
+    _rink_finalize = [MultiRinkFinalize()] if config.get("RINK_ANCHOR", False) else []
     return MultiCompose([
         MultiBoxXYWHtoXYXY(),
         MultiSimulate(max_shift_ratio=config["AUG_MAX_SHIFT_RATIO"], overflow_bbox=config["AUG_OVERFLOW_BBOX"]),
@@ -621,6 +804,7 @@ def build_transforms(config: dict):
         # MultiToDtype(torch.float32),
         # MultiNormalize(mean=mean, std=std),
         MultiNormalizeBoundingBoxes(),
+        *_rink_finalize,
         # For MOTIP, biding ID labels:
         GenerateIDLabels(
             num_id_vocabulary=config["NUM_ID_VOCABULARY"],
@@ -631,6 +815,11 @@ def build_transforms(config: dict):
             num_id_vocabulary=config["NUM_ID_VOCABULARY"],
             aug_trajectory_occlusion_prob=config["AUG_TRAJECTORY_OCCLUSION_PROB"],
             aug_trajectory_switch_prob=config["AUG_TRAJECTORY_SWITCH_PROB"],
+            aug_trajectory_switch_mode=config.get("AUG_TRAJECTORY_SWITCH_MODE", "uniform"),
+            aug_trajectory_switch_sigma=config.get("AUG_TRAJECTORY_SWITCH_SIGMA", 0.5),
+            aug_trajectory_contaminate_prob=config.get("AUG_TRAJECTORY_CONTAMINATE_PROB", 0.0),
+            aug_trajectory_contaminate_max_len=config.get("AUG_TRAJECTORY_CONTAMINATE_MAX_LEN", 5),
+            aug_trajectory_contaminate_iou=config.get("AUG_TRAJECTORY_CONTAMINATE_IOU", 0.1),
         ),
     ])
 

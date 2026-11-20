@@ -13,6 +13,7 @@ class Hockey(DanceTrack):
             sub_dir: str = "Hockey",
             split: str = "train",
             load_annotation: bool = True,
+            load_rink: bool = False,
     ):
         super(Hockey, self).__init__(
             data_root=data_root,
@@ -20,6 +21,17 @@ class Hockey(DanceTrack):
             split=split,
             load_annotation=load_annotation,
         )
+        # Rink anchor: per-sequence image -> rink transforms from <seq>/rink/ (sequences without it are skipped).
+        self.rink = {}
+        if load_rink:
+            from .rink import load_sequence_rink
+            for sequence_name in self.sequence_infos:
+                _r = load_sequence_rink(self._get_sequence_dir(self.data_dir, self.split, sequence_name))
+                if _r is not None:
+                    self.rink[sequence_name] = _r
+
+    def get_rink(self):
+        return self.rink
 
     @staticmethod
     def _get_image_path(sequence_dir, frame_idx):

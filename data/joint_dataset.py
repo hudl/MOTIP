@@ -3,6 +3,7 @@
 # you should always use JointDataset to combine and organize them (even if you only used one dataset).
 
 import copy
+import numpy as np
 import torch
 from collections import defaultdict
 from torch.utils.data import Dataset
@@ -59,6 +60,12 @@ class JointDataset(Dataset):
         self.sequence_infos = defaultdict(lambda: defaultdict(dict))
         self.image_paths = defaultdict(lambda: defaultdict(dict))
         self.annotations = defaultdict(lambda: defaultdict(dict))
+        # Rink anchor: per-sequence image -> rink transforms (only for datasets that ship the rink sidecar).
+        self.rink_anchor = bool(kwargs.get("rink_anchor", False))
+        # DETR_CACHE_DIR: the frozen detector's outputs are cached, so frames are never decoded: tiny placeholder images
+        # of the right aspect ratio stand in (boxes are scaled to them; everything downstream is normalised).
+        self.detr_cache = bool(kwargs.get("detr_cache", False))
+        self.rink = defaultdict(lambda: defaultdict(dict))
         for dataset, split in zip(datasets, splits):
             try:
                 extra_kwargs = self.dataset_kwargs.get(dataset, {})
@@ -71,6 +78,8 @@ class JointDataset(Dataset):
                 self.sequence_infos[dataset][split] = dataset_class.get_sequence_infos()
                 self.image_paths[dataset][split] = dataset_class.get_image_paths()
                 self.annotations[dataset][split] = dataset_class.get_annotations()
+                if self.rink_anchor and hasattr(dataset_class, "get_rink"):
+                    self.rink[dataset][split] = dataset_class.get_rink()
             except KeyError:
                 raise AttributeError(f"Dataset {dataset} is not supported.")
         # Decouple the 'is_legal' attribute from the annotations,
@@ -154,9 +163,15 @@ class JointDataset(Dataset):
         # images = [
         #     read_image(image_path) for image_path in image_paths
         # ]   # a list of tensors, shape=(C, H, W), dtype=torch.uint8
-        images = [
-            Image.open(image_path) for image_path in image_paths
-        ]  # a list of tensors, shape=(C, H, W), dtype=torch.uint8
+        if self.detr_cache:
+            _info = self.sequence_infos[dataset][split][sequence]
+            _pw, _ph = max(8, _info["width"] // 16), max(8, _info["height"] // 16)
+            _sx, _sy = _pw / _info["width"], _ph / _info["height"]
+            images = [Image.new("RGB", (_pw, _ph)) for _ in frame_idxs]
+        else:
+            images = [
+                Image.open(image_path) for image_path in image_paths
+            ]  # a list of tensors, shape=(C, H, W), dtype=torch.uint8
         # images = torch.stack(images, dim=0)     # shape=(N, C, H, W), dtype=torch.uint8
         # Get annotations:
         annotations = [
@@ -174,11 +189,26 @@ class JointDataset(Dataset):
                 "size_divisibility": self.size_divisibility,
             } for frame_idx in frame_idxs
         ]
+        if self.rink_anchor:
+            # Image -> rink matrix of each frame (NaN: none) and the augmentation bookkeeping that
+            # MultiRinkFinalize turns into the training-time projection (see data/rink.py).
+            from .rink import aug_init
+            _seq_rink = self.rink.get(dataset, {}).get(split, {}).get(sequence)
+            _w, _h = images[0].size
+            for frame_idx, meta in zip(frame_idxs, metas):
+                meta["rink_H"] = _seq_rink.frame_H(frame_idx) if _seq_rink is not None else np.full((3, 3), np.nan)
+                meta["rink_bounds"] = np.asarray(_seq_rink.bounds_m if _seq_rink is not None else (np.nan, np.nan), dtype=np.float64)
+                if self.detr_cache and not np.isnan(meta["rink_H"]).any():
+                    meta["rink_H"] = meta["rink_H"] @ np.diag([1.0 / _sx, 1.0 / _sy, 1.0])    # placeholder px -> metres
+                meta["rink_aug"] = aug_init(_w, _h)
         # Do some modifications:
         metas[0]["is_begin"] = True     # the first frame is the beginning of a video clip
         # Deep copy:
         annotations = [copy.deepcopy(annotation) for annotation in annotations]
         metas = [copy.deepcopy(meta) for meta in metas]
+        if self.detr_cache:
+            for annotation in annotations:
+                annotation["bbox"] = annotation["bbox"] * torch.tensor([_sx, _sy, _sx, _sy])
 
         # Apply transforms:
         if self.transforms is not None:

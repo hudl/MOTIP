@@ -1,0 +1,20 @@
+# v1 crossing fine-tune WITH the MOTIP2 priors: finetune_crossing_rfdetr_v1x_ctrl.yaml + the block below, nothing else.
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_v1x_ctrl.yaml
+EXP_NAME: rfdetr_crossing_finetune_v1x_priors
+
+# --- MOTIP2 priors (the only difference from the *_ctrl config) -----------------------------------------------------
+# Spatial ID switches: in every (group, frame) each visible object is selected with prob 1.0 and the selected ones are
+# permuted by Hungarian on GIoU + N(0, 0.5^2) (realised ~3.5% swaps, 77% of them overlapping boxes; sigma 0.7 gives ~10%).
+AUG_TRAJECTORY_SWITCH_PROB: 1.0
+AUG_TRAJECTORY_SWITCH_MODE: spatial
+AUG_TRAJECTORY_SWITCH_SIGMA: 0.5
+# Spatial ID loss: sum_c p_c (5 * L1 + 2 * (1 - GIoU)) to every candidate ID's box, on top of the CE.
+ID_LOSS_SPATIAL: True
+ID_LOSS_L1_WEIGHT: 5.0
+ID_LOSS_GIOU_WEIGHT: 2.0
+# Image-space spatial anchor, learnable per-channel scale initialised at 0 (step 0 == the model without it) at 100x LR.
+# The detector's ref_point_head is trainable here (joint training), so the anchor also shapes the detector.
+# Inference with these checkpoints needs SPATIAL_ANCHOR: True and SPATIAL_ANCHOR_SCALE_INIT: 0.0 (select_checkpoints.py --recipe priors).
+SPATIAL_ANCHOR: True
+SPATIAL_ANCHOR_SCALE_INIT: 0.0
+LR_ANCHOR_SCALE: 100.0

@@ -1,0 +1,4 @@
+# Eval config for checkpoints trained with the image spatial anchor (priors arms c, c2, e).
+SUPER_CONFIG_PATH: ./configs/eval_stage2_rfdetr_hockey.yaml
+SPATIAL_ANCHOR: True
+SPATIAL_ANCHOR_SCALE_INIT: 0.0

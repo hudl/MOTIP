@@ -22,6 +22,7 @@ class IDDecoder(nn.Module):
             rel_pe_length: int,
             use_aux_loss: bool,
             use_shared_aux_head: bool,
+            lookahead: dict | None = None,
     ):
         super().__init__()
 
@@ -91,9 +92,22 @@ class IDDecoder(nn.Module):
             if p.dim() > 1 and "rel_pos_embeds" not in n:
                 nn.init.xavier_uniform_(p)
 
+        # Look-ahead (cfg LOOKAHEAD, default off: no module, no parameters, forward unchanged): models/motip/lookahead.py.
+        # Built after the xavier init above so its zero-initialised (identity) layers stay zero, from a private RNG state
+        # so building it does not move the global RNG (data order / augmentations stay those of a run without it).
+        self.lookahead = None
+        if lookahead is not None:
+            from models.motip.lookahead import Lookahead
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(2)
+                self.lookahead = Lookahead(dim=self.feature_dim + self.id_dim, id_dim=self.id_dim, n_heads=self.n_heads,
+                                           num_layers=self.num_layers, **lookahead)
         pass
 
     def forward(self, seq_info, use_decoder_checkpoint):
+        if self.lookahead is not None:
+            from models.motip.lookahead import lookahead_forward
+            return lookahead_forward(self, seq_info, use_decoder_checkpoint)
         trajectory_features = seq_info["trajectory_features"]
         unknown_features = seq_info["unknown_features"]
         trajectory_id_labels = seq_info["trajectory_id_labels"]

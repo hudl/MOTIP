@@ -1,0 +1,13 @@
+# Team-cue ablation, arm T0 (control): the v1 crossing fine-tune recipe (finetune_crossing_rfdetr_v1.yaml: motip_crossing_dataset, stride 4,
+# SAMPLE_LENGTHS 20, SAMPLE_INTERVALS 4, LR 2e-5, 13 epochs, MILESTONES [10, 12], REL_PE 60) from the PRODUCTION checkpoint_12 (--resume-model),
+# but with the detector FROZEN and its outputs read from a cache (DETR_CACHE_DIR, utils/detr_cache.py): only the trajectory FFN and the ID
+# decoder train. No new inputs. T1 / T2 differ from this file only by the keys in their own files.
+# The cache (+ the lean copy of the dataset without frames) is the SageMaker "cache" / "train" channels; see submit stage rfdetr-tc-t0.
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_v1.yaml
+
+INFERENCE_DATASET:
+EXP_NAME: rfdetr_teamcue_t0
+
+DETR_FREEZE: True
+DETR_FROZEN_AUTOCAST: none
+DETR_CACHE_DIR: /opt/ml/input/data/cache
