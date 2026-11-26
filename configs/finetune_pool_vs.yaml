@@ -1,0 +1,27 @@
+# Data-recipe study arm vs (obsidian-vault/sessions/2026-11-20-motip-data-curation-audit.md). ONE tracking run: a NEW ID decoder
+# on a frozen detector read from the DETR cache: by default the stage-1 ihc-od RF-DETR (rfdetr_best_ema.pth, no tracking data
+# seen; POOL_DETECTOR=ckpt12 for the production detector). Train data = motip_pool_v1 (41 tracking_train clips, no tracking_val_v1 game).
+# Windows from SAMPLE_MANIFEST (data/manifest_sampler.py, scripts/data_prep/ice_hockey/make_window_manifest.py).
+# All arms share: ~6.0M window-frames (13 epochs x 461.5k), time = real frame offsets (TIME_UNIT frame), REL_PE 120,
+# stage-2 ID-decoder schedule (LR 5e-5, 1 warm-up epoch, x0.1 at epoch 10), MOTIP default trajectory augmentation.
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_v1.yaml
+DATA_ROOT: /mnt/s3files/faceoff/tracking_workgroup/tracking_experiments/motip_pool_v1
+INFERENCE_DATASET:
+DETR_PRETRAIN:
+DETR_FREEZE: True
+DETR_FROZEN_AUTOCAST: none
+DETR_CACHE_DIR: /opt/ml/input/data/cache
+DETR_CACHE_MAX_OPEN: 512   # keep the whole pool cache (~2 GB) in RAM, one copy per training process
+SAMPLE_MANIFEST: manifests/vs.json
+SAMPLE_MANIFEST_SAMPLES: 7692
+BATCH_SIZE: 1
+TIME_UNIT: frame
+REL_PE_LENGTH: 120
+EPOCHS: 13
+LR: 5.0e-5
+LR_WARMUP_EPOCHS: 1
+SCHEDULER_MILESTONES: [10, ]
+SCHEDULER_GAMMA: 0.1
+AUG_TRAJECTORY_OCCLUSION_PROB: 0.5
+AUG_TRAJECTORY_SWITCH_PROB: 0.5
+EXP_NAME: rfdetr_pool_vs

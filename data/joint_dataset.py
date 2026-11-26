@@ -66,6 +66,9 @@ class JointDataset(Dataset):
         # of the right aspect ratio stand in (boxes are scaled to them; everything downstream is normalised).
         self.detr_cache = bool(kwargs.get("detr_cache", False))
         self.rink = defaultdict(lambda: defaultdict(dict))
+        # ID_EMBED_TEAM: per-sequence {gt id: team} -> metas[i]['gt_team'] (training-only labels).
+        self.load_team = bool(kwargs.get("load_team", False))
+        self.team = defaultdict(lambda: defaultdict(dict))
         for dataset, split in zip(datasets, splits):
             try:
                 extra_kwargs = self.dataset_kwargs.get(dataset, {})
@@ -80,6 +83,8 @@ class JointDataset(Dataset):
                 self.annotations[dataset][split] = dataset_class.get_annotations()
                 if self.rink_anchor and hasattr(dataset_class, "get_rink"):
                     self.rink[dataset][split] = dataset_class.get_rink()
+                if self.load_team and hasattr(dataset_class, "get_team"):
+                    self.team[dataset][split] = dataset_class.get_team()
             except KeyError:
                 raise AttributeError(f"Dataset {dataset} is not supported.")
         # Decouple the 'is_legal' attribute from the annotations,
@@ -201,6 +206,11 @@ class JointDataset(Dataset):
                 if self.detr_cache and not np.isnan(meta["rink_H"]).any():
                     meta["rink_H"] = meta["rink_H"] @ np.diag([1.0 / _sx, 1.0 / _sy, 1.0])    # placeholder px -> metres
                 meta["rink_aug"] = aug_init(_w, _h)
+        if self.load_team:
+            _seq_team = self.team.get(dataset, {}).get(split, {}).get(sequence)
+            if _seq_team is not None:
+                for meta in metas:
+                    meta["gt_team"] = dict(_seq_team)
         # Do some modifications:
         metas[0]["is_begin"] = True     # the first frame is the beginning of a video clip
         # Deep copy:

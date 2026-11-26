@@ -1,0 +1,17 @@
+# v1x-priors + the rink XY anchor only (2026-11-21 joint plan, run 1 of 3): finetune_crossing_rfdetr_v1x_priors.yaml + the
+# block below, nothing else (same data, epochs, LR, seed, REL_PE_LENGTH 60, MISS_TOLERANCE 60, detector unfrozen). No distance bias.
+# See obsidian-vault/sessions/2026-11-21-joint-ablation-rink-idloss.md.
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_v1x_priors.yaml
+EXP_NAME: rfdetr_crossing_finetune_v1x_rinkxy
+
+# Each token's feet position in rink metres (per-frame homography) -> Fourier features -> MLP, added to its feature half.
+# Image-anchor recipe: the image anchor got used in the joint v1x-priors run (|scale| 0 -> 0.053) with a non-zero encoding x a
+# learnable per-channel scale initialised at 0, at 100x LR. Arm D's rink anchor (zero-init last MLP layer, 20x LR, frozen
+# detector) stayed at ~0. So: the MLP keeps its default (non-zero) init, a per-channel out_scale starts at 0 (step 0 ==
+# v1x_priors) and trains at 100x LR, WD 0; the MLP at 20x (it gets gradient once out_scale != 0); dropout 0.1 as arms D/E.
+RINK_ANCHOR: True
+RINK_ANCHOR_DROPOUT: 0.1
+RINK_ANCHOR_OUT_SCALE_INIT: 0.0
+LR_RINK_ANCHOR_SCALE: 20.0
+LR_RINK_ANCHOR_OUT_SCALE: 100.0
+# Inference / checkpoint selection: select_checkpoints.py --recipe rinkxy60 --joint-detector (per-frame homographies).

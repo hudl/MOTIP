@@ -17,6 +17,7 @@ from torchvision.transforms import v2
 from typing import Any, Generator, List
 
 from models.motip import build as build_motip
+from models.motip import take_match_guard_events
 from models.motip.id_criterion import build as build_id_criterion
 from runtime_option import runtime_option
 from utils.misc import yaml_to_dict, set_seed
@@ -32,6 +33,8 @@ from utils.nested_tensor import NestedTensor
 from utils.switch_stats import empty_switch_stats, add_switch_stats, clip_switch_stats, summarize_switch_stats
 from submit_and_evaluate import submit_and_evaluate_one_model
 
+
+import data.rink as _rink_mod
 
 def train_engine(config: dict):
     # Init some settings:
@@ -95,6 +98,9 @@ def train_engine(config: dict):
         )
         if train_sampler.variable_length:
             assert config["BATCH_SIZE"] == 1, f"SAMPLE_MANIFEST has windows of lengths {train_sampler.lengths}; needs BATCH_SIZE 1."
+        if config.get("TIME_UNIT", "step") == "frame":
+            _span = max(w["frame_idxs"][-1] - w["frame_idxs"][0] for w in train_sampler.windows)
+            assert _span < config["REL_PE_LENGTH"], f"TIME_UNIT frame: windows span {_span} frames, REL_PE_LENGTH is {config['REL_PE_LENGTH']}"
         logger.info(f"SAMPLE_MANIFEST={config['SAMPLE_MANIFEST']}: {len(train_sampler.windows)} candidate windows, "
                     f"{train_sampler.samples_per_epoch} per epoch, lengths {train_sampler.lengths}, dropped {train_sampler.dropped}.")
     else:
@@ -141,6 +147,12 @@ def train_engine(config: dict):
         )
     # Build Loss Function:
     id_criterion = build_id_criterion(config=config)
+    # ID_EMBED_LOSS: hard-negative identity loss on the detector's output embeddings (models/motip/id_embed_loss.py).
+    id_embed_criterion = None
+    if config.get("ID_EMBED_LOSS", False):
+        from models.motip.id_embed_loss import IDEmbedCriterion
+        assert not config["ONLY_DETR"], "ID_EMBED_LOSS needs the MOTIP part (GT-matched queries)."
+        id_embed_criterion = IDEmbedCriterion(config)
 
     # Build Optimizer:
     # DETR_FREEZE: detector fully frozen (eval mode, no_grad forward, no DETR losses — only the
@@ -189,8 +201,22 @@ def train_engine(config: dict):
             f"gate init={config.get('TEAM_CUE_GATE_INIT', 0.25)}, lr x{config.get('LR_TEAM_CUE_SCALE', 1.0)}, "
             f"kit stats from {_stats_path} ({_stats['n_rows']:,} rows)."
         )
+    if config.get("RINK_DIST_BIAS", False):
+        _rdb = [(n, p) for n, p in model.named_parameters() if ".rink_dist_bias." in n]
+        assert len(_rdb) > 0 and all(p.requires_grad for _, p in _rdb), "RINK_DIST_BIAS: no trainable rink_dist_bias parameters."
+        logger.info(f"RINK_DIST_BIAS on: {sum(p.numel() for _, p in _rdb):,} params, lr x{config.get('LR_RINK_DIST_BIAS_SCALE', 1.0)}.")
+    if config.get("ID_EMBED_LOSS", False):
+        _head = [(n, p) for n, p in model.named_parameters() if n.startswith("id_embed_head.")]
+        assert len(_head) > 0, "ID_EMBED_LOSS: the model has no id_embed_head."
+        _detr_trainable = any(p.requires_grad for n, p in model.named_parameters() if n.startswith("detr."))
+        logger.info(
+            f"ID_EMBED_LOSS on: head {sum(p.numel() for _, p in _head):,} params, weight {id_embed_criterion.weight}, "
+            f"temp {id_embed_criterion.temp}, hard x{id_embed_criterion.hard_weight} (IoU > {id_embed_criterion.hard_iou} or "
+            f"< {id_embed_criterion.hard_rink_m} m within {id_embed_criterion.hard_frames} steps), team={id_embed_criterion.team}, "
+            f"detector trainable={_detr_trainable} (DETR_NUM_TRAIN_FRAMES={config['DETR_NUM_TRAIN_FRAMES']}).")
     # Record the size of the added cue terms (kit, box anchor) on every ID-decoder forward and log them (cue_* metrics).
-    model.record_cue_stats = bool(config.get("TEAM_CUE", False) or config.get("SPATIAL_ANCHOR", False))
+    model.record_cue_stats = bool(config.get("TEAM_CUE", False) or config.get("SPATIAL_ANCHOR", False)
+                                  or config.get("RINK_ANCHOR", False))
     param_groups = get_param_groups(model, config)
     optimizer = AdamW(
         params=param_groups,
@@ -199,19 +225,10 @@ def train_engine(config: dict):
     )
     lr_scheduler_type = config.get("LR_SCHEDULER", "multistep")
     if lr_scheduler_type == "cosine":
-        _warmup_epochs = config["LR_WARMUP_EPOCHS"]
-        _total_epochs = config["EPOCHS"]
-        _min_lr_ratio = config.get("LR_MIN_RATIO", 0.01)
-
-        def _cosine_lambda(n):
-            epoch_for = n + 1
-            if epoch_for <= _warmup_epochs:
-                return 1.0
-            progress = (epoch_for - _warmup_epochs) / max(1, _total_epochs - _warmup_epochs)
-            progress = min(progress, 1.0)
-            return _min_lr_ratio + (1.0 - _min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
-
-        scheduler = LambdaLR(optimizer=optimizer, lr_lambda=_cosine_lambda)
+        scheduler = LambdaLR(optimizer=optimizer, lr_lambda=cosine_lr_lambda(
+            warmup_epochs=config["LR_WARMUP_EPOCHS"], total_epochs=config["EPOCHS"],
+            min_lr_ratio=config.get("LR_MIN_RATIO", 0.01),
+        ))
     else:
         scheduler = MultiStepLR(
             optimizer=optimizer,
@@ -231,15 +248,11 @@ def train_engine(config: dict):
             scheduler=scheduler if config["RESUME_SCHEDULER"] else None,
             states=train_states,
         )
-        # Different processing on scheduler:
-        if config["RESUME_SCHEDULER"]:
-            scheduler.step()
-        else:
-            for _ in range(0, train_states["start_epoch"]):
-                scheduler.step()
-        if not config.get("RESUME_STATES", True):
-            train_states["start_epoch"] = 0
-            train_states["global_step"] = 0
+        # Different processing on scheduler (and the RESUME_STATES reset, which has to come first):
+        position_scheduler_after_resume(
+            scheduler=scheduler, train_states=train_states,
+            resume_scheduler=config["RESUME_SCHEDULER"], resume_states=config.get("RESUME_STATES", True),
+        )
         logger.success(
             log=f"Resume the model from '{config['RESUME_MODEL']}', "
                 f"optimizer={config['RESUME_OPTIMIZER']}, "
@@ -283,7 +296,7 @@ def train_engine(config: dict):
             spatial_gate=config.get("SPATIAL_GATE", False),
             gate_base=config.get("GATE_BASE", 0.5),
             gate_per_step=config.get("GATE_PER_STEP", 0.2),
-            rink_anchor=config.get("RINK_ANCHOR", False),
+            rink_anchor=config.get("RINK_ANCHOR", False) or config.get("RINK_DIST_BIAS", False),
         )
         eval_metrics.sync()
         return eval_metrics
@@ -304,7 +317,8 @@ def train_engine(config: dict):
         )
 
     for epoch in range(train_states["start_epoch"], config["EPOCHS"]):
-        logger.info(log=f"Start training epoch {epoch}.")
+        logger.info(log=f"Start training epoch {epoch}. LR (group 0 / last): "
+                        f"{optimizer.param_groups[0]['lr']:.6e} / {optimizer.param_groups[-1]['lr']:.6e}.")
         epoch_start_timestamp = TPS.timestamp()
         # Prepare the sampler for the current epoch:
         # Update AUG_TRAJECTORY_SWITCH_PROB if a schedule is configured:
@@ -366,8 +380,10 @@ def train_engine(config: dict):
                 config.get("AUG_TRAJECTORY_SWITCH_PROB", 0.0) > 0.0
                 or config.get("AUG_TRAJECTORY_SWITCH_PROB_SCHEDULE") is not None
             ),
-            rink_anchor=config.get("RINK_ANCHOR", False),
+            rink_anchor=_rink_mod.needs_rink_data(config),
             detr_cache=detr_cache,
+            id_embed_criterion=id_embed_criterion,
+            id_embed_log_detr_grad_every=int(config.get("ID_EMBED_LOG_DETR_GRAD_EVERY", 0)),
         )
 
         _cue_line = {k: round(float(train_metrics.metrics[k].global_average), 4) for k in list(train_metrics.metrics.keys()) if str(k).startswith("cue_")}
@@ -474,8 +490,16 @@ def train_one_epoch(
         rink_anchor: bool = False,
         # DETR_CACHE_DIR: a utils.detr_cache.DetrCache of the frozen detector's outputs (skips the detector forward).
         detr_cache=None,
+        # ID_EMBED_LOSS: models.motip.id_embed_loss.IDEmbedCriterion (None = off); every N steps also log the norm of its
+        # gradient on the detector parameters (0 = never; an extra autograd.grad, for smoke tests).
+        id_embed_criterion=None,
+        id_embed_log_detr_grad_every: int = 0,
 ):
     current_last_checkpoint_idx = 0
+    if id_embed_log_detr_grad_every > 0 and accelerator.num_processes > 1:
+        # An extra torch.autograd.grad(retain_graph=True) inside a DDP step is unsupported by DDP: smoke tests only.
+        logger.warning("ID_EMBED_LOG_DETR_GRAD_EVERY > 0 is single-process only (autograd.grad inside DDP); disabled.")
+        id_embed_log_detr_grad_every = 0
     assert detr_cache is None or detr_freeze, "DETR_CACHE_DIR needs DETR_FREEZE: a trained detector's outputs change."
 
     model.train()
@@ -632,20 +656,25 @@ def train_one_epoch(
         if not only_detr:
             _G, _, _N = annotations[0][0]["trajectory_id_labels"].shape
             # Need to prepare for MOTIP:
+            _rink_batch = rink_batch_from_metas(metas) if rink_anchor else None
             seq_info = prepare_for_motip(
                 detr_outputs=detr_outputs, annotations=annotations, detr_indices=detr_indices,
                 with_gt_boxes=id_criterion.use_spatial_loss,
-                rink=rink_batch_from_metas(metas) if rink_anchor else None,
+                rink=_rink_batch,
             )
             if rink_anchor:
                 _tok_valid = torch.isfinite(seq_info["unknown_rink_xy"]).all(dim=-1)[~seq_info["unknown_masks"]]
                 metrics.update(name="rink_valid_frac", value=_tok_valid.float().mean().item() if _tok_valid.numel() else 1.0)
             seq_info = model(seq_info=seq_info, part="trajectory_modeling")
-            id_logits, id_gts, id_masks = model(
+            _embed_recs, _embed_flat = (id_embed_criterion.gather(detr_outputs, detr_indices, annotations, rink=_rink_batch, metas=metas)
+                                        if id_embed_criterion is not None else (None, None))
+            _dec_out = model(
                 seq_info=seq_info,
                 part="id_decoder",
                 use_decoder_checkpoint=use_decoder_checkpoint,
+                id_embed_inputs=_embed_flat,
             )
+            id_logits, id_gts, id_masks = _dec_out[:3]
             id_loss = id_criterion(id_logits=id_logits, id_labels=id_gts, id_masks=id_masks)
             if model_without_ddp.record_cue_stats:
                 for _k, _v in model_without_ddp.take_cue_stats().items():
@@ -664,12 +693,32 @@ def train_one_epoch(
                 id_loss = id_loss \
                     + id_criterion.l1_weight * id_loss_parts["id_l1"] \
                     + id_criterion.giou_weight * id_loss_parts["id_giou"]
+            if id_embed_criterion is not None:
+                _embed_terms, _embed_stats = id_embed_criterion.loss(_embed_recs, _dec_out[3], device)
+                id_embed_total = _embed_terms.pop("total")
+                for _k, _v in _embed_terms.items():
+                    id_loss_parts[_k] = _v
+                for _k, _v in _embed_stats.items():
+                    # Same metric names on every rank whatever the batch (a NaN stat, e.g. no hard negative in this
+                    # rank's window, is registered empty instead of skipped; see log.Metrics.sync):
+                    if _v == _v:
+                        metrics.update(name=_k, value=_v)
+                    else:
+                        metrics.touch(_k)
+                if id_embed_log_detr_grad_every > 0 and step % id_embed_log_detr_grad_every == 0 and len(detr_params) > 0:
+                    _g = torch.autograd.grad(id_embed_total, detr_params, retain_graph=True, allow_unused=True)
+                    _gn = torch.sqrt(sum((g.float() ** 2).sum() for g in _g if g is not None) + 0.0)
+                    metrics.update(name="id_embed_detr_grad_norm", value=float(_gn))
+                    metrics.update(name="id_embed_detr_grad_params", value=float(sum(g is not None and bool(g.abs().sum() > 0) for g in _g)))
+            else:
+                id_embed_total = None
             _num_gts_per_frame = max(_num_gts_per_frame, id_gts.shape[-1])
             # print(f"Num of GTs per frame: {_num_gts_per_frame}")
             pass
         else:
             id_loss = None
             id_loss_parts = {}
+            id_embed_total = None
 
         # Backward:
         with accelerator.autocast():
@@ -679,15 +728,27 @@ def train_one_epoch(
                 torch.zeros((), device=device),
             )
             loss = detr_loss + (id_loss if id_loss is not None else 0) * id_criterion.weight
-            # Logging losses:
-            metrics.update(name="loss", value=loss.item())
-            metrics.update(name="detr_loss", value=detr_loss.item())
+            if id_embed_total is not None:
+                loss = loss + id_embed_total
+            # Non-finite batch guard, rank-invariant: one all-reduce on every rank every step; if the loss is non-finite on
+            # any rank, every rank zero-weights its loss (same backward, same DDP gradient all-reduce) and drops the
+            # gradients before the optimizer step, so no rank skips a collective and no NaN reaches the weights.
+            nonfinite_skip = nonfinite_loss_on_any_rank(loss, accelerator=accelerator, device=device)
+            # Logging losses (a non-finite value only registers its name: same names on every rank, no NaN in the means):
+            update_or_touch(metrics, "loss", loss.item())
+            update_or_touch(metrics, "detr_loss", detr_loss.item())
             if id_loss is not None:
-                metrics.update(name="id_loss", value=id_loss.item())
+                update_or_touch(metrics, "id_loss", id_loss.item())
             for k, v in id_loss_parts.items():
-                metrics.update(name=k, value=v.item())
+                update_or_touch(metrics, k, v.item())
             for k, v in detr_loss_dict.items():
-                metrics.update(name=k, value=v.item())
+                update_or_touch(metrics, k, v.item())
+            # Guard counters (both matchers, events this step) + the skip flag, recorded on every rank every step.
+            metrics.update(name="nonfinite_loss_skip", value=float(nonfinite_skip))
+            for k, v in take_match_guard_events().items():
+                metrics.update(name=k, value=float(v))
+            if nonfinite_skip:
+                loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0) * 0.0
             if log_switch_stats:
                 _switch = empty_switch_stats()
                 for _clip in annotations:
@@ -699,6 +760,8 @@ def train_one_epoch(
             loss /= accumulate_steps
             accelerator.backward(loss)  # use this line to replace loss.backward()
             if (step + 1) % accumulate_steps == 0:
+                if nonfinite_skip:
+                    optimizer.zero_grad()     # every rank: the gradients of a skipped batch never reach the weights
                 if use_accelerate_clip_norm:
                     if separate_clip_norm:
                         detr_grad_norm = accelerator.clip_grad_norm_(detr_params, max_norm=max_clip_norm) \
@@ -716,8 +779,8 @@ def train_one_epoch(
                         accelerator.unscale_gradients()
                         detr_grad_norm = other_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_clip_norm)
                 # Hack implementation to log grad_norm
-                metrics.update(name="detr_grad_norm", value=detr_grad_norm.item())
-                metrics.update(name="other_grad_norm", value=other_grad_norm.item())
+                update_or_touch(metrics, "detr_grad_norm", detr_grad_norm.item())
+                update_or_touch(metrics, "other_grad_norm", other_grad_norm.item())
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -874,6 +937,10 @@ def get_param_groups(model, config) -> list[dict]:
                 group = {"params": p, "lr": base_lr * rink_lr_scale, "lr_scale": rink_lr_scale}
                 if n.endswith("bias") or n.endswith("no_position"):
                     group["weight_decay"] = 0.0
+                if n.endswith("out_scale"):
+                    # RINK_ANCHOR_OUT_SCALE_INIT: the per-channel output scale gets the image anchor's treatment
+                    _s = config.get("LR_RINK_ANCHOR_OUT_SCALE", rink_lr_scale)
+                    group = {"params": p, "lr": base_lr * _s, "lr_scale": _s, "weight_decay": 0.0}
                 param_groups.append(group)
                 rink_set.add(n)
 
@@ -901,8 +968,28 @@ def get_param_groups(model, config) -> list[dict]:
                 param_groups.append(group)
                 la_set.add(n)
 
+        # 4f. Rink-distance attention bias tables (zero-init): own LR multiplier, no weight decay.
+        rdb_set = set()
+        rdb_lr_scale = config.get("LR_RINK_DIST_BIAS_SCALE", 1.0)
+        for n, p in model.named_parameters():
+            if ".rink_dist_bias." in n and p.requires_grad:
+                param_groups.append({"params": p, "lr": base_lr * rdb_lr_scale, "lr_scale": rdb_lr_scale, "weight_decay": 0.0})
+                rdb_set.add(n)
+
+        # 4g. Identity-loss projection head (new, randomly initialised): own LR multiplier; biases get no weight decay.
+        head_set = set()
+        head_lr_scale = config.get("LR_ID_EMBED_HEAD_SCALE", 1.0)
+        for n, p in model.named_parameters():
+            if n.startswith("id_embed_head.") and p.requires_grad:
+                group = {"params": p, "lr": base_lr * head_lr_scale, "lr_scale": head_lr_scale}
+                if n.endswith("bias"):
+                    group["weight_decay"] = 0.0
+                param_groups.append(group)
+                head_set.add(n)
+
         # 5. Remaining params: full base LR
-        all_special = backbone_set | decoder_set | linproj_set | dict_set | anchor_set | rink_set | team_set | la_set
+        all_special = backbone_set | decoder_set | linproj_set | dict_set | anchor_set | rink_set | team_set | la_set \
+            | rdb_set | head_set
         for n, p in model.named_parameters():
             if n not in all_special and p.requires_grad:
                 param_groups.append({"params": p, "lr": base_lr})
@@ -940,6 +1027,54 @@ def get_param_groups(model, config) -> list[dict]:
         }
     ]
     return param_groups
+
+
+def update_or_touch(metrics, name: str, value: float):
+    """metrics.update for a finite value; a non-finite one only registers the name (see log.Metrics.sync)."""
+    if math.isfinite(value):
+        metrics.update(name=name, value=value)
+    else:
+        metrics.touch(name)
+
+
+def nonfinite_loss_on_any_rank(loss, accelerator, device) -> bool:
+    """True on every rank if the loss is non-finite on any rank. Called by every rank at every step (one all-reduce)."""
+    bad = torch.tensor([0.0 if bool(torch.isfinite(loss.detach()).all()) else 1.0], device=device)
+    if accelerator.num_processes > 1:
+        bad = accelerator.reduce(bad, reduction="sum")
+    return bool(bad.item() > 0)
+
+
+def cosine_lr_lambda(warmup_epochs: int, total_epochs: int, min_lr_ratio: float = 0.01):
+    """LambdaLR factor for epoch n (the scheduler is stepped once per epoch): 1 during warmup, then a cosine to min_lr_ratio."""
+    def _cosine_lambda(n):
+        epoch_for = n + 1
+        if epoch_for <= warmup_epochs:
+            return 1.0
+        progress = (epoch_for - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        progress = min(progress, 1.0)
+        return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return _cosine_lambda
+
+
+def position_scheduler_after_resume(scheduler, train_states: dict, resume_scheduler: bool, resume_states: bool):
+    """Put the per-epoch scheduler where the run starts, after load_checkpoint filled train_states from the checkpoint.
+
+    RESUME_STATES False (a fresh fine-tune from a checkpoint): epoch and step restart at 0 and so does the schedule.
+    This reset used to come after the scheduler was stepped start_epoch times with the *checkpoint's* start_epoch, so
+    every v1x run (from stage-2 checkpoint_5, start_epoch 6) used the LR of epoch e + 6 at epoch e (2026-11-22 note).
+    RESUME_SCHEDULER True (a real resume): the saved scheduler state is loaded, one step moves it to the next epoch.
+    RESUME_SCHEDULER False with RESUME_STATES True: stepped start_epoch times, as before.
+    """
+    if not resume_states:
+        train_states["start_epoch"] = 0
+        train_states["global_step"] = 0
+    if resume_scheduler:
+        scheduler.step()
+    else:
+        for _ in range(0, train_states["start_epoch"]):
+            scheduler.step()
+    return
 
 
 def lr_warmup(optimizer, epoch: int, curr_iter: int, tgt_lr: float, warmup_epochs: int, num_iter_per_epoch: int):

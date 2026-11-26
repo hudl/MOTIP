@@ -1,0 +1,29 @@
+# v1x-priors + a hard-negative identity loss on the RF-DETR output embeddings the ID decoder consumes (arm 5 of the
+# 2026-11-21 joint plan): finetune_crossing_rfdetr_v1x_priors.yaml + the block below, nothing else (same data, epochs, LR,
+# seed, REL_PE_LENGTH 60, MISS_TOLERANCE 60, detector unfrozen). No team input anywhere.
+# See obsidian-vault/sessions/2026-11-21-joint-ablation-rink-idloss.md and models/motip/id_embed_loss.py.
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_v1x_priors.yaml
+EXP_NAME: rfdetr_crossing_finetune_v1x_idloss
+
+# Supervised contrastive (InfoNCE) over every GT-matched query of a window: same GT id in other frames = positive.
+# Projection head 256 -> 256 -> 128 (L2-normalised); the raw 256-d embedding is not forced into a metric space.
+ID_EMBED_LOSS: True
+ID_EMBED_LOSS_WEIGHT: 0.1
+ID_EMBED_TEMP: 0.1
+ID_EMBED_HIDDEN: 256
+ID_EMBED_DIM: 128
+# Hard negatives: another identity whose GT box overlaps (IoU > 0.1) or whose feet are < 1.5 m away on the rink, at most
+# 1 sampled step apart; weight 4 in the denominator. (Rink distance needs the rink sidecar: loaded for this arm only for
+# that purpose; the model gets no rink input.)
+ID_EMBED_HARD_WEIGHT: 4.0
+ID_EMBED_HARD_IOU: 0.1
+ID_EMBED_HARD_RINK_M: 1.5
+ID_EMBED_HARD_FRAMES: 1
+LR_ID_EMBED_HEAD_SCALE: 50.0
+# Optional GT-team auxiliary term on the same projected embeddings: built, OFF here (needs a gt/gt_team.txt sidecar,
+# which motip_crossing_dataset does not have).
+ID_EMBED_TEAM: False
+# Inference / checkpoint selection: unchanged recipe (the head is training-only): select_checkpoints.py --recipe priors60 --joint-detector.
+# Never the extra autograd.grad of the identity term's detector gradient in a multi-GPU job (smoke-only diagnostic;
+# train.py also forces it off when num_processes > 1). See the 2026-11-22 NCCL-hang note in the session file.
+ID_EMBED_LOG_DETR_GRAD_EVERY: 0

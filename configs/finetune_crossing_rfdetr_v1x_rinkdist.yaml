@@ -1,0 +1,14 @@
+# v1x-priors + the rink-distance attention bias only (2026-11-21 joint plan, run 2 of 3): finetune_crossing_rfdetr_v1x_priors.yaml
+# + the block below, nothing else (same data, epochs, LR, seed, REL_PE_LENGTH 60, MISS_TOLERANCE 60, detector unfrozen). No XY anchor:
+# the model never sees a rink position, only pairwise distances. See obsidian-vault/sessions/2026-11-21-joint-ablation-rink-idloss.md.
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_v1x_priors.yaml
+EXP_NAME: rfdetr_crossing_finetune_v1x_rinkdist
+
+# Learned per-layer, per-head piecewise-linear bias over the pairwise feet distance (metres; knots 0..30 m, dense below 3 m)
+# on the ID decoder's unknown -> trajectory cross-attention and unknown <-> unknown self-attention (models/motip/rink_dist_bias.py).
+# Zero-init tables (step 0 == v1x_priors); exactly zero for a pair with a token without a position (no homography / off the rink).
+# 100x LR, WD 0 (a zero-init table at the 2e-5 fine-tune LR would barely move in 13 epochs). The rink sidecar is loaded for the XY.
+RINK_DIST_BIAS: True
+RINK_DIST_BIAS_SELF_ATTN: True
+LR_RINK_DIST_BIAS_SCALE: 100.0
+# Inference / checkpoint selection: select_checkpoints.py --recipe rinkdist60 --joint-detector (per-frame homographies).

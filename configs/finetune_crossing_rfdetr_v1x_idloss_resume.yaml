@@ -1,0 +1,8 @@
+# v1x_idloss resumed from its own checkpoint_2.pth (end of epoch 2, with optimizer + scheduler state) after the epoch-3 NCCL hang
+# (2026-11-22: rank-dependent metric names in log.Metrics.sync; fixed in log/log.py + train.py). Identical recipe to v1x_idloss;
+# RESUME_STATES keeps epoch / global step, so training continues at epoch 3 (checkpoint_3 .. checkpoint_12 in the new job's prefix).
+# The entrypoint passes --resume-optimizer true --resume-scheduler true (cosine LambdaLR: last_epoch 2 -> step -> 3).
+# See obsidian-vault/sessions/2026-11-21-joint-ablation-rink-idloss.md.
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_v1x_idloss.yaml
+RESUME_STATES: True
+EXP_NAME: rfdetr_crossing_finetune_v1x_idloss_resume

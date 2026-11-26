@@ -14,6 +14,7 @@ class Hockey(DanceTrack):
             split: str = "train",
             load_annotation: bool = True,
             load_rink: bool = False,
+            load_team: bool = False,
     ):
         super(Hockey, self).__init__(
             data_root=data_root,
@@ -30,8 +31,20 @@ class Hockey(DanceTrack):
                 if _r is not None:
                     self.rink[sequence_name] = _r
 
+        # ID_EMBED_TEAM (training only): {gt track id: team} per sequence from <seq>/gt/gt_team.txt (missing -> none).
+        self.team = {}
+        if load_team:
+            from .rink import load_gt_team
+            for sequence_name in self.sequence_infos:
+                _t = load_gt_team(self._get_sequence_dir(self.data_dir, self.split, sequence_name))
+                if _t is not None:
+                    self.team[sequence_name] = _t
+
     def get_rink(self):
         return self.rink
+
+    def get_team(self):
+        return self.team
 
     @staticmethod
     def _get_image_path(sequence_dir, frame_idx):

@@ -201,8 +201,9 @@ def load_checkpoint(model, path, states=None, optimizer=None, scheduler=None):
         _own = model.state_dict()
         for _k in _own:
             if (_k in ("anchor_scale", "module.anchor_scale")
-                    or _k.startswith(("rink_anchor.", "module.rink_anchor.", "team_cue.", "module.team_cue."))
-                    or ".lookahead." in _k) \
+                    or _k.startswith(("rink_anchor.", "module.rink_anchor.", "team_cue.", "module.team_cue.",
+                                      "id_embed_head.", "module.id_embed_head."))
+                    or ".lookahead." in _k or ".rink_dist_bias." in _k) \
                     and _k not in model_state:
                 model_state[_k] = _own[_k].clone()
         model.load_state_dict(model_state)

@@ -48,14 +48,22 @@ class RinkAnchor(nn.Module):
     """
 
     def __init__(self, dim: int = 256, n_freq: int = 24, hidden: int = 256, min_period_m: float = 1.0,
-                 max_period_m: float = 64.0, dropout: float = 0.0):
+                 max_period_m: float = 64.0, dropout: float = 0.0, out_scale_init: float | None = None):
         super().__init__()
         assert 0.0 <= dropout <= 1.0, dropout
         self.dim, self.n_freq, self.dropout = dim, n_freq, float(dropout)
         self.min_period_m, self.max_period_m = float(min_period_m), float(max_period_m)
         self.mlp = nn.Sequential(nn.Linear(4 * n_freq, hidden), nn.GELU(), nn.Linear(hidden, dim))
-        nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
+        # out_scale_init None (default, arms D / E): the last layer starts at zero. A float: the image-anchor recipe that
+        # did get used in the joint v1x-priors run (scale |.| 0 -> 0.053): the MLP keeps its default (non-zero) init and a
+        # learnable per-channel out_scale (initialised at out_scale_init, normally 0) multiplies its output, so step 0
+        # still equals the model without the anchor while the gradient of every output channel is live from step 0.
+        self.out_scale = None
+        if out_scale_init is None:
+            nn.init.zeros_(self.mlp[-1].weight)
+            nn.init.zeros_(self.mlp[-1].bias)
+        else:
+            self.out_scale = nn.Parameter(torch.full((dim,), float(out_scale_init)))
         self.no_position = nn.Parameter(torch.zeros(dim))
 
     def encode(self, xy: torch.Tensor) -> torch.Tensor:
@@ -72,4 +80,6 @@ class RinkAnchor(nn.Module):
             valid = valid & (torch.rand(valid.shape, device=valid.device) >= self.dropout)
         feat = self.encode(torch.where(valid.unsqueeze(-1), xy, torch.zeros_like(xy)))
         pos = self.mlp(feat.to(self.mlp[0].weight.dtype))
+        if self.out_scale is not None:
+            pos = pos * self.out_scale.to(pos.dtype)
         return torch.where(valid.unsqueeze(-1), pos, self.no_position.to(pos.dtype).expand_as(pos))

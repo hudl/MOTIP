@@ -103,7 +103,7 @@ def submit_and_evaluate(config: dict):
         spatial_gate=config.get("SPATIAL_GATE", False),
         gate_base=config.get("GATE_BASE", 0.5),
         gate_per_step=config.get("GATE_PER_STEP", 0.2),
-        rink_anchor=config.get("RINK_ANCHOR", False),
+        rink_anchor=config.get("RINK_ANCHOR", False) or config.get("RINK_DIST_BIAS", False),
     )
 
     if metrics is not None:

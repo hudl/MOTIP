@@ -1,0 +1,8 @@
+# v1x_rinkdist_fix resumed from its own checkpoint_9.pth (end of epoch 9, with optimizer + scheduler state) after the epoch-10 CUDA
+# OOM in backward (2026-11-25). Identical recipe; RESUME_STATES keeps epoch / global step, so training continues at epoch 10
+# (checkpoint_10 .. checkpoint_12 in the new job prefix). The entrypoint passes --resume-optimizer true --resume-scheduler true:
+# the saved cosine LambdaLR (last_epoch 9) is loaded and stepped once -> epoch 10 at 2e-5 x lambda(10) = 1.334e-6
+# (position_scheduler_after_resume keeps the saved state). See obsidian-vault/sessions/2026-11-24-v1x-dist-fixes.md.
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_v1x_rinkdist_fix.yaml
+RESUME_STATES: True
+EXP_NAME: rfdetr_crossing_finetune_v1x_rinkdist_fix_resume

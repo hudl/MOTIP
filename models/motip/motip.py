@@ -20,6 +20,7 @@ class MOTIP(nn.Module):
             rink_anchor_kwargs: dict | None = None,
             team_cue: bool = False,
             team_cue_kwargs: dict | None = None,
+            id_embed_head: dict | None = None,
     ):
         super().__init__()
         self.detr = detr
@@ -65,6 +66,14 @@ class MOTIP(nn.Module):
             with torch.random.fork_rng(devices=[]):   # as for the rink anchor: building it must not move the global RNG
                 torch.manual_seed(1)
                 self.team_cue = TeamCue(dim=detr_hidden_dim, **(team_cue_kwargs or {}))
+        # ID_EMBED_LOSS: projection head of the hard-negative identity loss on the detector's output embeddings
+        # (models/motip/id_embed_loss.py). Training only (inference never calls it). Off by default: no module.
+        self.id_embed_head = None
+        if id_embed_head is not None:
+            from .id_embed_loss import IDEmbedHead
+            with torch.random.fork_rng(devices=[]):   # as for the rink anchor: building it must not move the global RNG
+                torch.manual_seed(3)
+                self.id_embed_head = IDEmbedHead(**id_embed_head)
         # Size of each added term relative to the detection features, recorded on every id_decoder forward while
         # ``record_cue_stats`` is on (training loop / check script); read and cleared with ``take_cue_stats``.
         self.record_cue_stats = False
@@ -101,7 +110,16 @@ class MOTIP(nn.Module):
                 if self.team_cue is not None:
                     seq_info = self.add_team_cue(seq_info)
                 use_decoder_checkpoint = kwargs["use_decoder_checkpoint"] if "use_decoder_checkpoint" in kwargs else False
-                return self.id_decoder(seq_info, use_decoder_checkpoint=use_decoder_checkpoint)
+                out = self.id_decoder(seq_info, use_decoder_checkpoint=use_decoder_checkpoint)
+                if kwargs.get("id_embed_inputs") is not None:
+                    # ID_EMBED_LOSS: the projection head runs inside the same (last) DDP forward as the ID decoder, so
+                    # DDP's find_unused_parameters traversal from this forward's outputs reaches the head's parameters
+                    # (a separate forward, or a call outside DDP, would make DDP mark them unused / ready twice).
+                    out = (*out, self.id_embed_head(kwargs["id_embed_inputs"]))
+                return out
+            case "id_embed":
+                # ID_EMBED_LOSS: projected unit vectors of detector embeddings (through the DDP wrapper like the other parts)
+                return self.id_embed_head(kwargs["embeds"])
             case _:
                 raise NotImplementedError(f"MOTIP forwarding doesn't support part={kwargs['part']}.")
 
@@ -146,7 +164,10 @@ class MOTIP(nn.Module):
             xy = seq_info.get(f"{k}_rink_xy")
             if xy is None:
                 xy = torch.full((*features.shape[:-1], 2), float("nan"), device=features.device)
-            seq_info[f"{k}_features"] = features + self.rink_anchor(xy.to(features.device)).to(features.dtype)
+            _pos = self.rink_anchor(xy.to(features.device))
+            if self.record_cue_stats:
+                self._record("rink", _pos, features, seq_info.get(f"{k}_masks"))
+            seq_info[f"{k}_features"] = features + _pos.to(features.dtype)
         return seq_info
 
     def add_team_cue(self, seq_info: dict) -> dict:
@@ -187,6 +208,12 @@ class MOTIP(nn.Module):
         if self.team_cue is not None:
             out["kit_gate"] = float(self.team_cue.gate.detach())
             out["kit_missing_norm"] = float(self.team_cue.missing.detach().norm())
+        if self.rink_anchor is not None and self.rink_anchor.out_scale is not None:
+            out["rink_scale_mean"] = float(self.rink_anchor.out_scale.detach().abs().mean())
+            out["rink_scale_max"] = float(self.rink_anchor.out_scale.detach().abs().max())
+        _rdb = getattr(self.id_decoder, "rink_dist_bias", None) if self.id_decoder is not None else None
+        if _rdb is not None:
+            out["rink_dist_bias_absmax"] = float(_rdb.cross.detach().abs().max())
         if self.anchor_scale is not None:
             out["box_scale_mean"] = float(self.anchor_scale.detach().abs().mean())
             out["box_scale_max"] = float(self.anchor_scale.detach().abs().max())

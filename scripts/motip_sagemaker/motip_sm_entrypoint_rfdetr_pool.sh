@@ -34,16 +34,23 @@ ls "$SM_CHANNEL_CACHE/Hockey/train" | wc -l
 ls "$SM_CHANNEL_TRAIN/Hockey/train" | wc -l
 ls "$SM_CHANNEL_TRAIN/manifests"
 
-echo "=== Launching pool arm ${POOL_ARM} (4x A10G, frozen RF-DETR from v1 checkpoint_12, DETR cache) ==="
+echo "=== Launching pool arm ${POOL_ARM} (4x A10G, frozen RF-DETR ${POOL_DETECTOR:-stage1}, DETR cache) ==="
+# POOL_INIT=fresh (default): a NEW ID decoder on a frozen detector loaded with --detr-pretrain $POOL_DETR_FILE, i.e. one tracking
+# run on top of the detector. POOL_DETECTOR (submit script) picks it: stage1 (default) = rfdetr_best_ema.pth, the ihc-od RF-DETR
+# that has seen no tracking data; ckpt12 = ckpt12_detector_only.pth, the production detector. POOL_INIT=ckpt12: fine-tune all of checkpoint_12.
+if [ "${POOL_INIT:-fresh}" = "ckpt12" ]; then
+  INIT_ARGS="--resume-model $SM_CHANNEL_PRETRAIN/${RESUME_CKPT_NAME:-checkpoint_12.pth} --resume-optimizer false --resume-scheduler false"
+else
+  INIT_ARGS="--detr-pretrain $SM_CHANNEL_PRETRAIN/${POOL_DETR_FILE:-rfdetr_best_ema.pth}"
+fi
+echo "init: ${POOL_INIT:-fresh} -> ${INIT_ARGS}"
 NPROC=$(python -c "import torch; print(max(1, torch.cuda.device_count()))")
 echo "processes: $NPROC"
 accelerate launch --num_processes=$NPROC train.py \
   --data-root "$SM_CHANNEL_TRAIN" \
   --exp-name "rfdetr_pool_${POOL_ARM}" \
   --config-path "./configs/finetune_pool_${POOL_ARM}.yaml" \
-  --resume-model "$SM_CHANNEL_PRETRAIN/${RESUME_CKPT_NAME:-checkpoint_12.pth}" \
-  --resume-optimizer false \
-  --resume-scheduler false \
+  ${INIT_ARGS} \
   --num-workers 4 \
   --prefetch-factor 4 \
   --save-checkpoint-per-epoch 1 \

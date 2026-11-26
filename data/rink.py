@@ -156,3 +156,30 @@ def finalize_meta(meta: dict) -> None:
     h = np.asarray(meta.pop("rink_H"), dtype=np.float64)
     meta["rink_Hn"] = h @ aug_norm_to_orig(a)
     meta["rink_flip"] = bool(a["flip"])
+
+
+def needs_rink_data(config: dict) -> bool:
+    """Whether training needs the per-frame rink transforms (the sidecar loader, MultiRinkFinalize and the per-token feet
+    XY in prepare_for_motip): the rink anchor, the rink-distance attention bias, or the identity loss's rink-distance
+    hard negatives (ID_EMBED_LOSS with ID_EMBED_HARD_RINK_M > 0)."""
+    return bool(
+        config.get("RINK_ANCHOR", False)
+        or config.get("RINK_DIST_BIAS", False)
+        or (config.get("ID_EMBED_LOSS", False) and float(config.get("ID_EMBED_HARD_RINK_M", 1.5)) > 0)
+    )
+
+
+def load_gt_team(sequence_dir: str) -> dict | None:
+    """``{gt track id: team}`` from ``<seq>/gt/gt_team.txt`` (lines ``track_id,team``; team an int, -1 = unknown), or None
+    without the file. Training-only labels for the optional ID_EMBED_TEAM term."""
+    path = os.path.join(sequence_dir, "gt", "gt_team.txt")
+    if not os.path.isfile(path):
+        return None
+    out = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                a, b = line.split(",")[:2]
+                out[int(float(a))] = int(float(b))
+    return out

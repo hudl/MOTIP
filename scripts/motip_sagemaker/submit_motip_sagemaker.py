@@ -78,6 +78,19 @@ ENTRYPOINTS = {
     # To run v1x on top of an s2x arm: PRETRAIN_PREFIX_OVERRIDE=<s2x checkpoints/<job> S3 dir> RESUME_CKPT_NAME=checkpoint_5.pth.
     "rfdetr-v1x-ctrl": "motip_sm_entrypoint_rfdetr_v1x_ctrl.sh",
     "rfdetr-v1x-priors": "motip_sm_entrypoint_rfdetr_v1x_priors.sh",
+    # v1x-priors + one change each (2026-11-21-joint-ablation-rink-idloss): rinkxy = rink XY anchor (out-scale recipe);
+    # rinkdist = rink-distance attention bias; idloss = hard-negative identity loss on the detector embeddings.
+    # Same data / pretrain / instance as v1x.
+    "rfdetr-v1x-rinkxy": "motip_sm_entrypoint_rfdetr_v1x_rinkxy.sh",
+    "rfdetr-v1x-rinkdist": "motip_sm_entrypoint_rfdetr_v1x_rinkdist.sh",
+    "rfdetr-v1x-idloss": "motip_sm_entrypoint_rfdetr_v1x_idloss.sh",
+    # idloss resumed from its own checkpoint_2 (epochs 3-12) after the epoch-3 NCCL hang (2026-11-22); same output prefix as idloss.
+    "rfdetr-v1x-idloss-resume": "motip_sm_entrypoint_rfdetr_v1x_idloss_resume.sh",
+    # 2026-11-24 (sessions/2026-11-24-v1x-dist-fixes.md): rinkdist re-run with the LR-schedule fix (cosine from epoch 0) and the
+    # RF-DETR criterion matcher NaN guard. Same data / pretrain / instance / cap as rinkdist.
+    "rfdetr-v1x-rinkdist-fix": "motip_sm_entrypoint_rfdetr_v1x_rinkdist_fix.sh",
+    # ... resumed from its own checkpoint_9 (epochs 10-12) after the epoch-10 CUDA OOM (2026-11-25); same output prefix.
+    "rfdetr-v1x-rinkdist-fix-resume": "motip_sm_entrypoint_rfdetr_v1x_rinkdist_fix_resume.sh",
     # Team-cue ablation (frozen RF-DETR from the production v1 checkpoint_12, detector outputs read from a DETR cache, new inputs
     # trained with the ID decoder). One entrypoint; the arm is the stage suffix (TC_ARM): t0 control, t1 + team cue, t2 + team cue + box anchor.
     # Channels: train = lean copy of motip_crossing_dataset (gt / seqinfo, no frames), cache = DETR cache + kit descriptors + kit_stats.json,
@@ -96,6 +109,7 @@ ENTRYPOINTS = {
     "rfdetr-pool-w1": "motip_sm_entrypoint_rfdetr_pool.sh",
     "rfdetr-pool-m50": "motip_sm_entrypoint_rfdetr_pool.sh",
     "rfdetr-pool-a1": "motip_sm_entrypoint_rfdetr_pool.sh",
+    "rfdetr-pool-vs": "motip_sm_entrypoint_rfdetr_pool.sh",
     "rfdetr-s2x-ctrl": "motip_sm_entrypoint_rfdetr_s2x_ctrl.sh",
     "rfdetr-s2x-priors": "motip_sm_entrypoint_rfdetr_s2x_priors.sh",
     "stage1-stad-ablation": "motip_sm_entrypoint_stage1_stad_ablation.sh",
@@ -124,9 +138,20 @@ TC_ARM = STAGE.rsplit("-", 1)[1] if IS_TEAMCUE else None   # t0 | t1 | t2
 IS_LOOKAHEAD = STAGE.startswith("rfdetr-la-")
 LA_ARM = STAGE.rsplit("-", 1)[1] if IS_LOOKAHEAD else None  # ctrl | l8
 IS_POOL = STAGE.startswith("rfdetr-pool-")
-POOL_ARM = STAGE.rsplit("-", 1)[1] if IS_POOL else None  # c1 | w1 | m50 | a1
+POOL_ARM = STAGE.rsplit("-", 1)[1] if IS_POOL else None  # c1 | w1 | m50 | a1 | vs
 IS_RFDETR_S2X = STAGE.startswith("rfdetr-s2x-")
-V1X_S2X_ARM = STAGE.rsplit("-", 1)[1] if (IS_RFDETR_V1X or IS_RFDETR_S2X) else None  # ctrl | priors
+IS_V1X_IDLOSS_RESUME = STAGE == "rfdetr-v1x-idloss-resume"
+V1X_FIX_ARMS = {"rfdetr-v1x-rinkdist-fix": "rinkdist_fix", "rfdetr-v1x-rinkdist-fix-resume": "rinkdist_fix"}
+IS_V1X_RINKDIST_FIX_RESUME = STAGE == "rfdetr-v1x-rinkdist-fix-resume"
+V1X_S2X_ARM = ("idloss" if IS_V1X_IDLOSS_RESUME
+               else V1X_FIX_ARMS[STAGE] if STAGE in V1X_FIX_ARMS
+               else STAGE.rsplit("-", 1)[1] if (IS_RFDETR_V1X or IS_RFDETR_S2X) else None)  # ctrl | priors | rinkxy | rinkdist | idloss | *_fix
+# The idloss resume reads exactly this checkpoint (end of epoch 2 of the hung job, with optimizer + scheduler + states):
+# The rinkdist_fix resume reads exactly this checkpoint (end of epoch 9 of the OOM job, with optimizer + scheduler + states):
+V1X_RINKDIST_FIX_RESUME_CKPT = ("s3://hudl-experiments-v1/finlay/motip_rfdetr_v1x_rinkdist_fix/checkpoints/"
+                                "motip-hockey-rfdetr-v1x-rinkdist-fix-2026-11-25-00-25-57/checkpoint_9.pth")
+V1X_IDLOSS_RESUME_CKPT = ("s3://hudl-experiments-v1/finlay/motip_rfdetr_v1x_idloss/checkpoints/"
+                          "motip-hockey-rfdetr-v1x-idloss-2026-11-21-18-41-57/checkpoint_2.pth")
 IS_RFDETR_STAGE2_HOCKEY = STAGE == "rfdetr-stage2-hockey" or IS_RFDETR_S2X
 IS_RFDETR_STAGE2_HOCKEY_RESUME = STAGE == "rfdetr-stage2-hockey-resume"
 IS_RFDETR_CROSSING_FINETUNE_S2 = STAGE == "rfdetr-crossing-finetune-s2"
@@ -176,7 +201,7 @@ elif IS_POOL:
     OUTPUT_BUCKET_PREFIX = f"s3://hudl-experiments-v1/finlay/motip_rfdetr_pool_{POOL_ARM}"
     INSTANCE_TYPE = os.environ.get("POOL_INSTANCE_TYPE", "ml.g5.12xlarge")
     NUM_INSTANCES = 1
-    MAX_RUNTIME = 12 * 3600  # T0-sized budget (114k window-frames/epoch x 13): ~2 h expected
+    MAX_RUNTIME = 24 * 3600  # fresh ID decoder, ~6M window-frames: ~6.5-8.5 h expected on 4x A10G
 elif IS_TEAMCUE:
     DATA_BUCKET_PREFIX = "s3://hudl-experiments-v1/finlay/teamcue/dataset_lean"
     OUTPUT_BUCKET_PREFIX = f"s3://hudl-experiments-v1/finlay/motip_rfdetr_teamcue_{TC_ARM}"
@@ -190,6 +215,10 @@ elif IS_RFDETR_V1X:
     INSTANCE_TYPE = "ml.g5.12xlarge"
     NUM_INSTANCES = 1
     MAX_RUNTIME = 30 * 3600  # estimate ~10-15 h for 13 epochs (see the 2026-11-19 session note); 30 h cap
+    if IS_V1X_RINKDIST_FIX_RESUME:
+        MAX_RUNTIME = 7 * 3600  # 3 epochs x ~1.2 h measured + ~25 min setup ~ 4 h (~$23); 7 h cap = $40 max (approved up to $40)
+    if IS_V1X_IDLOSS_RESUME:
+        MAX_RUNTIME = 12 * 3600  # 10 epochs x ~1.1 h measured + setup; budget ~$62 approved (12 h cap = $68 max)
 elif IS_RFDETR_S2X:
     DATA_BUCKET_PREFIX = "s3://hudl-experiments-v1/faceoff/metaflow/data/tracking_workgroup/tracking_experiments/motip_hockey_data"
     OUTPUT_BUCKET_PREFIX = f"s3://hudl-experiments-v1/finlay/motip_rfdetr_s2x_{V1X_S2X_ARM}"
@@ -338,6 +367,7 @@ else:
 session = sagemaker.session.Session(boto3.Session(region_name="us-east-1"))
 
 timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+DRY_RUN = os.environ.get("MOTIP_SM_DRY_RUN", "") not in ("", "0")  # resolve + print the job, submit nothing
 job_name = f"motip-hockey-{STAGE}-{timestamp}"
 # SageMaker caps job names at 63 chars and ModelTrainer appends its own suffix, truncating the result; a base
 # longer than 60 can be cut on a '-' (invalid). Drop the 'hockey-' infix for long stage names.
@@ -346,7 +376,7 @@ if len(job_name) > 60:
 assert len(job_name) <= 60, f"job name too long for SageMaker: {job_name}"
 
 print(f"Retrieving SageMaker PyTorch training image for {INSTANCE_TYPE}...")
-pytorch_image_uri = sagemaker.image_uris.retrieve(
+pytorch_image_uri = "<dry-run: pytorch 2.8.0 training image>" if DRY_RUN else sagemaker.image_uris.retrieve(
     framework="pytorch",
     region=session.boto_region_name,
     version="2.8.0",
@@ -357,7 +387,15 @@ print(f"Using image: {pytorch_image_uri}")
 
 _prepare = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prepare_motip_staging.sh")
 print("Preparing staging directory...")
-subprocess.run(["bash", _prepare], check=True)
+# The staging dir /tmp/motip_sm_staging is shared and rebuilt (rm -rf + cp) by every submit, and ModelTrainer uploads it at
+# train(): two submits at once race on it (2026-11-21: a v1x submit failed that way). Submits therefore hold an exclusive
+# lock from staging to upload; a second concurrent submit waits here. Run submits one at a time anyway.
+import fcntl
+_staging_lock = open("/tmp/motip_sm_staging.lock", "w")
+if not DRY_RUN:
+    print("Waiting for the staging lock (/tmp/motip_sm_staging.lock)...")
+    fcntl.flock(_staging_lock, fcntl.LOCK_EX)
+    subprocess.run(["bash", _prepare], check=True)
 print(f"Staging ready at {SOURCE_DIR}")
 
 source_code = SourceCode(source_dir=SOURCE_DIR, command=f"bash {ENTRYPOINT}")
@@ -412,7 +450,10 @@ model_trainer = ModelTrainer(
         **({"RESUME_CKPT_NAME": os.environ["RESUME_CKPT_NAME"]} if os.environ.get("RESUME_CKPT_NAME") else {}),
         **({"TC_ARM": TC_ARM} if IS_TEAMCUE else {}),
         **({"LA_ARM": LA_ARM} if IS_LOOKAHEAD else {}),
-        **({"POOL_ARM": POOL_ARM} if IS_POOL else {}),
+        **({"POOL_ARM": POOL_ARM, "POOL_INIT": os.environ.get("POOL_INIT", "fresh"),
+            "POOL_DETECTOR": os.environ.get("POOL_DETECTOR", "stage1"),
+            "POOL_DETR_FILE": "ckpt12_detector_only.pth" if os.environ.get("POOL_DETECTOR") == "ckpt12" else "rfdetr_best_ema.pth"}
+           if IS_POOL else {}),
     },
 )
 
@@ -423,8 +464,22 @@ model_trainer = ModelTrainer(
 #   stage2-amf-resume:  stage-2 checkpoint_1.pth (epoch 1, resume full training)
 PRETRAIN_PREFIX = os.environ.get("PRETRAIN_PREFIX_OVERRIDE") or (
     # team-cue arms: the production v1 checkpoint_12 on its own (a copy of the one in .../motip_rfdetr_crossing_finetune_v1/checkpoints/...-13-03-48)
+    # pool arms: POOL_INIT=fresh (default) needs a detector-only checkpoint: POOL_DETECTOR=stage1 (default) the ihc-od RF-DETR,
+    # POOL_DETECTOR=ckpt12 the production detector; POOL_INIT=ckpt12 the whole checkpoint_12.
+    ("s3://hudl-experiments-v1/finlay/teamcue/base_ckpt12" if os.environ.get("POOL_INIT") == "ckpt12"
+     else "s3://hudl-experiments-v1/finlay/motip_pool_v1/pretrain" if os.environ.get("POOL_DETECTOR") == "ckpt12"
+     else "s3://hudl-experiments-v1/finlay/motip_rfdetr_pretrain")
+    if IS_POOL
+    else
     "s3://hudl-experiments-v1/finlay/teamcue/base_ckpt12"
-    if (IS_TEAMCUE or IS_LOOKAHEAD or IS_POOL)
+    if (IS_TEAMCUE or IS_LOOKAHEAD)
+    else
+    # v1x idloss resume: the S3 prefix of the single checkpoint file (the channel then holds checkpoint_2.pth only).
+    V1X_IDLOSS_RESUME_CKPT
+    if IS_V1X_IDLOSS_RESUME
+    else
+    V1X_RINKDIST_FIX_RESUME_CKPT
+    if IS_V1X_RINKDIST_FIX_RESUME
     else
     # priors-c2 resumes arm c from its own epoch-3 checkpoint.
     "s3://hudl-experiments-v1/finlay/motip_rfdetr_crossing_finetune_s1_long_priors_c/checkpoints/motip-hockey-rfdetr-s1-long-priors-c-2026-11-18-16-50-53"
@@ -510,12 +565,24 @@ if IS_TEAMCUE or IS_LOOKAHEAD:
     print(f"arm {TC_ARM or LA_ARM}: cache channel {TC_CACHE_URI}")
 
 if IS_POOL:
-    POOL_CACHE_URI = os.environ.get("POOL_CACHE_URI", "s3://hudl-experiments-v1/finlay/motip_pool_v2/pool-v2/cache")
+    # caches are built over motip_pool_v2 (all 50 clips; v1's chunks are identical): pool-s1 = stage-1 detector, pool-v2 = ckpt_12's
+    POOL_CACHE_URI = os.environ.get("POOL_CACHE_URI", "s3://hudl-experiments-v1/finlay/motip_pool_v2/"
+                                    + ("pool-v2" if os.environ.get("POOL_DETECTOR") == "ckpt12" else "pool-s1") + "/cache")
     input_data_config.append(InputData(channel_name="cache", data_source=POOL_CACHE_URI))
     print(f"pool arm {POOL_ARM}: cache channel {POOL_CACHE_URI}")
 
+if DRY_RUN:
+    print(f"\n[DRY RUN] stage {STAGE}: job {job_name}, entrypoint {ENTRYPOINT}, {NUM_INSTANCES}x {INSTANCE_TYPE}, "
+          f"max runtime {MAX_RUNTIME / 3600:.0f} h")
+    print(f"[DRY RUN] checkpoints -> {OUTPUT_BUCKET_PREFIX}/checkpoints/{job_name}")
+    for _c in input_data_config:
+        print(f"[DRY RUN] channel {_c.channel_name}: {_c.data_source}")
+    print(f"[DRY RUN] environment: { {k: v for k, v in model_trainer.environment.items()} }")
+    print("[DRY RUN] nothing submitted (unset MOTIP_SM_DRY_RUN to submit).")
+    sys.exit(0)
 print("\nSubmitting job...")
 model_trainer.train(input_data_config=input_data_config, wait=False)
+fcntl.flock(_staging_lock, fcntl.LOCK_UN)   # source uploaded: the next submit may restage
 print(f"\nSubmitted job: {job_name}")
 print(f"Monitor: https://console.aws.amazon.com/sagemaker/home?region={session.boto_region_name}#/jobs")
 print(f"Logs: aws logs tail /aws/sagemaker/TrainingJobs --follow --log-stream-name-prefix {job_name}")

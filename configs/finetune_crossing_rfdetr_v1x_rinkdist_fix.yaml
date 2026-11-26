@@ -1,0 +1,7 @@
+# Run A of 2026-11-24 (sessions/2026-11-24-v1x-dist-fixes.md): exactly finetune_crossing_rfdetr_v1x_rinkdist.yaml (v1x-priors
+# + RINK_DIST_BIAS), re-run with two code fixes and no config change:
+#   1. train.py position_scheduler_after_resume: the cosine starts at epoch 0 for this fresh fine-tune from stage-2 checkpoint_5
+#      (every earlier v1x run was 6 epochs ahead: epoch e used lambda(e + 6), at the floor from epoch 6).
+#   2. models/motip GuardedSetMatcher: NaN guard on RF-DETR's own criterion matcher + rank-invariant non-finite batch skip.
+SUPER_CONFIG_PATH: ./configs/finetune_crossing_rfdetr_v1x_rinkdist.yaml
+EXP_NAME: rfdetr_crossing_finetune_v1x_rinkdist_fix

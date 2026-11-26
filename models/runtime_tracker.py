@@ -117,7 +117,10 @@ class RuntimeTracker:
         if rink_gate and rink_fps <= 0:
             raise ValueError(f"rink_fps must be > 0, not {rink_fps}")
         self.rink_gate = bool(rink_gate)
-        self.rink_anchor = bool(rink_anchor)
+        # ``rink_anchor`` here means "keep each token's feet XY and feed it to the ID decoder": needed by the rink anchor and
+        # by the rink-distance attention bias (RINK_DIST_BIAS), so it is switched on by itself for a model with the bias.
+        self.rink_anchor = bool(rink_anchor) or (
+            getattr(getattr(get_model(model), "id_decoder", None), "rink_dist_bias", None) is not None)
         self.team_cue = bool(team_cue)
         self._kit_dim = int(get_model(model).team_cue.in_dim) if self.team_cue else 0
         self._kit_cur = None             # (D, K) float32 kit descriptors aligned with the boxes the ID decoder sees

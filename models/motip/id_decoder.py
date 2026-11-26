@@ -23,6 +23,7 @@ class IDDecoder(nn.Module):
             use_aux_loss: bool,
             use_shared_aux_head: bool,
             lookahead: dict | None = None,
+            rink_dist_bias: dict | None = None,
     ):
         super().__init__()
 
@@ -102,6 +103,12 @@ class IDDecoder(nn.Module):
                 torch.manual_seed(2)
                 self.lookahead = Lookahead(dim=self.feature_dim + self.id_dim, id_dim=self.id_dim, n_heads=self.n_heads,
                                            num_layers=self.num_layers, **lookahead)
+        # Rink-distance attention bias (cfg RINK_DIST_BIAS, default off: no module, no parameters, forward unchanged):
+        # models/motip/rink_dist_bias.py. Zero-initialised tables (no RNG drawn), so step 0 == the decoder without it.
+        self.rink_dist_bias = None
+        if rink_dist_bias is not None:
+            from models.motip.rink_dist_bias import RinkDistBias
+            self.rink_dist_bias = RinkDistBias(num_layers=self.num_layers, n_heads=self.n_heads, **rink_dist_bias)
         pass
 
     def forward(self, seq_info, use_decoder_checkpoint):
@@ -143,6 +150,26 @@ class IDDecoder(nn.Module):
         rel_pe_idx_pairs = rel_pe_idx_pairs.to(trajectory_features.device)
         rel_pe_idxs = self.rel_pos_map[rel_pe_idx_pairs[..., 0], rel_pe_idx_pairs[..., 1]]      # (B*G, T_curr, T_traj)
         pass
+        # Rink-distance bias: pairwise feet distances (metres) unknown -> trajectory and unknown <-> unknown (same frame),
+        # from seq_info['{trajectory,unknown}_rink_xy'] (NaN / missing = no position -> zero bias for that pair).
+        dist_cross, dist_self = None, None
+        if self.rink_dist_bias is not None:
+            _t_xy, _u_xy = seq_info.get("trajectory_rink_xy"), seq_info.get("unknown_rink_xy")
+            if _t_xy is None:
+                _t_xy = torch.full((*trajectory_features.shape[:-1], 2), float("nan"), device=trajectory_features.device)
+            if _u_xy is None:
+                _u_xy = torch.full((*unknown_features.shape[:-1], 2), float("nan"), device=unknown_features.device)
+            dist_cross = self.rink_dist_bias.interp(
+                einops.rearrange(_u_xy, "b g t n c -> (b g) (t n) c"),
+                einops.rearrange(_t_xy, "b g t n c -> (b g) (t n) c"),
+            )
+            if self.rink_dist_bias.self_ is not None and self.num_layers > 1:
+                _u_flat = einops.rearrange(_u_xy, "b g t n c -> (b g t) n c")
+                dist_self = self.rink_dist_bias.interp(_u_flat, _u_flat)
+                # a float attn_mask goes with a float key_padding_mask (same masking, no mixed-type deprecation path)
+                self_attn_key_padding_mask = torch.masked_fill(
+                    self_attn_key_padding_mask.float(), mask=self_attn_key_padding_mask, value=float("-inf"),
+                ).to(self.dtype)
         # Change Cross-Attn key_padding_mask and attn_mask to float:
         cross_attn_key_padding_mask = torch.masked_fill(
             cross_attn_key_padding_mask.float(),
@@ -169,6 +196,7 @@ class IDDecoder(nn.Module):
                     unknown_embeds, trajectory_embeds,
                     self_attn_key_padding_mask, cross_attn_key_padding_mask,
                     cross_attn_mask, rel_pe_idxs,
+                    dist_cross, dist_self,
                     use_reentrant=False,
                 )
             else:
@@ -180,6 +208,8 @@ class IDDecoder(nn.Module):
                     cross_attn_key_padding_mask=cross_attn_key_padding_mask,
                     cross_attn_mask=cross_attn_mask,
                     rel_pe_idx=rel_pe_idxs,
+                    dist_cross=dist_cross,
+                    dist_self=dist_self,
                 )
 
             _unknown_id_logits = self.embed_to_word_layers[layer](unknown_embeds[..., -self.id_dim:])
@@ -208,14 +238,18 @@ class IDDecoder(nn.Module):
             cross_attn_key_padding_mask: torch.Tensor,
             cross_attn_mask: torch.Tensor,
             rel_pe_idx: torch.Tensor,
+            dist_cross=None,
+            dist_self=None,
     ):
         _B, _G, _T, _N, _ = trajectory_embeds.shape
         _curr_B, _curr_G, _curr_T, _curr_N, _ = unknown_embeds.shape
         if layer > 0:   # use self-attention to transfer information between unknown features (same time step)
             self_unknown_embeds = einops.rearrange(unknown_embeds, "b g t n c -> (b g t) n c").contiguous()
+            _self_bias = self.rink_dist_bias.self_bias(layer, dist_self) if dist_self is not None else None
             self_out, _ = self.self_attn_layers[layer - 1](
                 query=self_unknown_embeds, key=self_unknown_embeds, value=self_unknown_embeds,
                 key_padding_mask=self_attn_key_padding_mask,
+                attn_mask=_self_bias.to(self_unknown_embeds.dtype) if _self_bias is not None else None,
             )
             self_out = self_unknown_embeds + self_out
             self_out = self.self_attn_norm_layers[layer - 1](self_out)
@@ -227,6 +261,9 @@ class IDDecoder(nn.Module):
         # Prepare attn_mask:
         rel_pe_mask = self.rel_pos_embeds[layer][rel_pe_idx]
         cross_attn_mask_with_rel_pe = cross_attn_mask + einops.rearrange(rel_pe_mask, "bg l1 l2 n -> (bg n) l1 l2")
+        if dist_cross is not None:
+            cross_attn_mask_with_rel_pe = cross_attn_mask_with_rel_pe + \
+                self.rink_dist_bias.cross_bias(layer, dist_cross).to(cross_attn_mask_with_rel_pe.dtype)
         # Apply cross-attention:
         cross_out, _ = self.cross_attn_layers[layer](
             query=cross_unknown_embeds, key=cross_trajectory_embeds, value=cross_trajectory_embeds,

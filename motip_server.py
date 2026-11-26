@@ -213,7 +213,7 @@ def _rink_kwargs(cfg: dict, rink: dict | None) -> dict:
         rink_gate=bool(cfg.get("RINK_GATE", False)),
         rink_gate_base_m=cfg.get("RINK_GATE_BASE_M", 2.0),
         rink_gate_speed_mps=cfg.get("RINK_GATE_SPEED_MPS", 10.0),
-        rink_anchor=bool(cfg.get("RINK_ANCHOR", False)),
+        rink_anchor=bool(cfg.get("RINK_ANCHOR", False) or cfg.get("RINK_DIST_BIAS", False)),
         team_cue=bool(cfg.get("TEAM_CUE", False)),
         quarantine=bool(cfg.get("QUARANTINE", False)),
         quarantine_iou=float(cfg.get("QUARANTINE_IOU", 0.3)),
@@ -288,9 +288,9 @@ def run_sequence_from_frames(
     """
     dtype_str = cfg.get("INFERENCE_DTYPE", "FP32")
     dtype = torch.float16 if dtype_str == "FP16" else torch.float32
-    if cfg.get("RINK_ANCHOR", False) and rink is None:
+    if (cfg.get("RINK_ANCHOR", False) or cfg.get("RINK_DIST_BIAS", False)) and rink is None:
         logging.getLogger(__name__).warning(
-            "RINK_ANCHOR is on but no rink transforms were given: every token gets the no-position embedding.")
+            "RINK_ANCHOR / RINK_DIST_BIAS is on but no rink transforms were given: every token has no position.")
 
     sequence_hw = (vid_h, vid_w)
     runtime_tracker = RuntimeTracker(

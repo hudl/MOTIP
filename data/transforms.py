@@ -412,10 +412,15 @@ class MultiNormalizeBoundingBoxes:
 # For MOTIP only, biding the ID label:
 
 class GenerateIDLabels:
-    def __init__(self, num_id_vocabulary: int, aug_num_groups: int, num_training_ids: int):
+    def __init__(self, num_id_vocabulary: int, aug_num_groups: int, num_training_ids: int, time_unit: str = "step"):
         self.num_id_vocabulary = num_id_vocabulary
         self.aug_num_groups = aug_num_groups
         self.num_training_ids = num_training_ids
+        # TIME_UNIT: "step" = the original MOTIP time index (0..T-1, whatever the sampling interval);
+        # "frame" = each frame's offset in sequence frames from the window's first frame, so a gap of k means k frames
+        # in training as at inference (the runtime tracker counts one per frame). Needs REL_PE_LENGTH > the window span.
+        assert time_unit in ("step", "frame"), f"unknown TIME_UNIT {time_unit!r}"
+        self.time_unit = time_unit
 
     def __call__(self, images, annotations, metas):
         _T = len(images)
@@ -468,7 +473,12 @@ class GenerateIDLabels:
             id_masks[group] = base_id_masks.clone()
             ann_idxs[group] = base_ann_idxs.clone()
         # Generate the time indexes:
-        times = torch.arange(_T, dtype=torch.int64)[None, :, None].repeat(_G, 1, _N)
+        if self.time_unit == "frame":
+            _f = [int(m["frame_idx"]) for m in metas]
+            assert all(b > a for a, b in zip(_f, _f[1:])), f"TIME_UNIT frame needs increasing frame indices, got {_f}"
+            times = torch.tensor([f - _f[0] for f in _f], dtype=torch.int64)[None, :, None].repeat(_G, 1, _N)
+        else:
+            times = torch.arange(_T, dtype=torch.int64)[None, :, None].repeat(_G, 1, _N)
         # Check the shapes:
         assert id_labels.shape == id_masks.shape == ann_idxs.shape == times.shape
 
@@ -741,7 +751,7 @@ def build_cached_transforms(config: dict):
     image-space augmentation that can still be applied is the horizontal flip (``DETR_CACHE_FLIP``, on its boxes); the
     images are tiny placeholders (see JointDataset). Resize / crop / colour jitter are dropped: the normalised boxes do not
     change under an aspect-preserving resize, and a crop or a colour change would need a detector forward."""
-    _rink_finalize = [MultiRinkFinalize()] if config.get("RINK_ANCHOR", False) else []
+    _rink_finalize = [MultiRinkFinalize()] if _rink.needs_rink_data(config) else []
     return MultiCompose([
         MultiBoxXYWHtoXYXY(),
         MultiStack(),
@@ -755,6 +765,7 @@ def build_cached_transforms(config: dict):
             num_id_vocabulary=config["NUM_ID_VOCABULARY"],
             aug_num_groups=config["AUG_NUM_GROUPS"],
             num_training_ids=config.get("NUM_TRAINING_IDS", config["NUM_ID_VOCABULARY"]),
+            time_unit=config.get("TIME_UNIT", "step"),
         ),
         TurnIntoTrajectoryAndUnknown(
             num_id_vocabulary=config["NUM_ID_VOCABULARY"],
@@ -774,7 +785,7 @@ def build_transforms(config: dict):
         return build_cached_transforms(config)
     # mean = [0.485, 0.456, 0.406]
     # std = [0.229, 0.224, 0.225]
-    _rink_finalize = [MultiRinkFinalize()] if config.get("RINK_ANCHOR", False) else []
+    _rink_finalize = [MultiRinkFinalize()] if _rink.needs_rink_data(config) else []
     return MultiCompose([
         MultiBoxXYWHtoXYXY(),
         MultiSimulate(max_shift_ratio=config["AUG_MAX_SHIFT_RATIO"], overflow_bbox=config["AUG_OVERFLOW_BBOX"]),
@@ -810,6 +821,7 @@ def build_transforms(config: dict):
             num_id_vocabulary=config["NUM_ID_VOCABULARY"],
             aug_num_groups=config["AUG_NUM_GROUPS"],
             num_training_ids=config.get("NUM_TRAINING_IDS", config["NUM_ID_VOCABULARY"]),
+            time_unit=config.get("TIME_UNIT", "step"),
         ),
         TurnIntoTrajectoryAndUnknown(
             num_id_vocabulary=config["NUM_ID_VOCABULARY"],

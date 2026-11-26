@@ -17,9 +17,31 @@ class Metrics:
         self.metrics[name].update(value)
         return
 
+    def touch(self, name: str):
+        """Register name without a value (e.g. a statistic that is undefined, NaN, on this rank's batch), so every
+        rank holds the same metric names."""
+        _ = self.metrics[name]
+        return
+
     def sync(self):
-        for name, value in self.metrics.items():
-            value.sync()
+        # IHC: every rank must issue the same collectives in the same order. Each Value.sync is a barrier + two
+        # all_gather_object, so a metric name that exists on some ranks only (a statistic first recorded at different
+        # steps, or skipped as NaN on one rank) desynchronises the collectives and hangs NCCL (the 2026-11-21 v1x_idloss
+        # job: ALLREDUCE on one rank vs ALLGATHER on the others). Sync the union of the names, in an order identical on
+        # every rank (rank 0's names first, then the others' in rank order); a name missing locally is synced empty.
+        if is_distributed():
+            gathered = [None] * distributed_world_size()
+            torch.distributed.all_gather_object(gathered, list(self.metrics.keys()))
+            names, seen = [], set()
+            for lst in gathered:
+                for n in lst:
+                    if n not in seen:
+                        seen.add(n)
+                        names.append(n)
+        else:
+            names = list(self.metrics.keys())
+        for name in names:
+            self.metrics[name].sync()
         return
 
     def __getitem__(self, item):
@@ -129,16 +151,22 @@ class Value:
     @property
     def average(self):
         self._check_sync()
-        return self.value_sync.mean().item()
+        if self.value_sync.numel() == 0:        # no value on any rank in the window (see Metrics.touch)
+            return float("nan")
+        return self.value_sync.float().mean().item()
 
     @property
     def global_average(self):
         self._check_sync()
+        if not self.total_count_sync:
+            return float("nan")
         return self.total_value_sync / self.total_count_sync
 
     @property
     def median(self):
         self._check_sync()
+        if self.value_sync.numel() == 0:
+            return float("nan")
         return self.value_sync.median().item()
 
     def fmt(self, fmt):

@@ -55,22 +55,28 @@ def sanitize_match_inputs(single: dict, targets: list) -> tuple[dict, list, bool
     return out, new_targets, changed
 
 
-def l1_fallback_match(single: dict, targets: list) -> list:
-    """Hungarian on finite L1 box cost only, the same (pred_idx, tgt_idx) format as the RF-DETR matcher."""
+def l1_fallback_match(single: dict, targets: list, group_detr: int = 1) -> list:
+    """Hungarian on finite L1 box cost only, the same (pred_idx, tgt_idx) format as the RF-DETR matcher
+    (with group_detr > 1: one match per query group, query indices offset by the group, as RF-DETR does)."""
     import torch
     from scipy.optimize import linear_sum_assignment
     res = []
     boxes = single["pred_boxes"]
+    g_q = boxes.shape[1] // max(1, group_detr)
     for i, t in enumerate(targets):
         tb = t["boxes"]
         if tb.numel() == 0:
             e = torch.as_tensor([], dtype=torch.int64)
             res.append((e, e.clone()))
             continue
-        c = torch.cdist(boxes[i].float(), tb.float(), p=1)
-        c = torch.nan_to_num(c, nan=1e6, posinf=1e6, neginf=1e6).cpu().numpy()
-        r, k = linear_sum_assignment(c)
-        res.append((torch.as_tensor(r, dtype=torch.int64), torch.as_tensor(k, dtype=torch.int64)))
+        rs, ks = [], []
+        for g in range(max(1, group_detr)):
+            c = torch.cdist(boxes[i, g * g_q:(g + 1) * g_q].float(), tb.float(), p=1)
+            c = torch.nan_to_num(c, nan=1e6, posinf=1e6, neginf=1e6).cpu().numpy()
+            r, k = linear_sum_assignment(c)
+            rs.append(torch.as_tensor(r, dtype=torch.int64) + g * g_q)
+            ks.append(torch.as_tensor(k, dtype=torch.int64))
+        res.append((torch.cat(rs), torch.cat(ks)))
     return res
 
 
@@ -88,6 +94,60 @@ def guarded_match(matcher, single: dict, targets: list) -> list:
         MATCH_GUARD_STATS["fallback"] += 1
         with torch.no_grad():
             return l1_fallback_match(single, targets)
+
+
+# The same protection for the matcher *inside* RF-DETR's own SetCriterion (lwdetr.py SetCriterion.forward: last layer, every
+# aux layer, the encoder output), which the job-killing 'matrix contains invalid numeric entries' came from (arm C, idloss resume).
+DETR_MATCH_GUARD_STATS = {"calls": 0, "sanitized": 0, "fallback": 0}
+
+
+class GuardedSetMatcher:
+    """Drop-in for SetCriterion.matcher: matcher(outputs, targets, group_detr) on sanitised inputs, the grouped L1 fallback
+    if it still raises. Never raises on non-finite costs. Counts events in DETR_MATCH_GUARD_STATS (train.py logs them).
+    Matching does not depend on other ranks, so this changes nothing about the collectives; a batch whose loss is still
+    non-finite is zero-weighted on every rank in train.py (nonfinite_loss_skip)."""
+
+    def __init__(self, matcher):
+        self.matcher = matcher
+
+    def __call__(self, outputs, targets, group_detr=1):
+        import torch
+        DETR_MATCH_GUARD_STATS["calls"] += 1
+        single = {k: outputs[k] for k in ("pred_logits", "pred_boxes")}
+        single, targets, changed = sanitize_match_inputs(single, targets)
+        if changed:
+            DETR_MATCH_GUARD_STATS["sanitized"] += 1
+        try:
+            with torch.no_grad():
+                return self.matcher(single, targets, group_detr=group_detr)
+        except ValueError:
+            DETR_MATCH_GUARD_STATS["fallback"] += 1
+            with torch.no_grad():
+                return l1_fallback_match(single, targets, group_detr=group_detr)
+
+
+def install_criterion_match_guard(criterion):
+    """Replace criterion.matcher (RF-DETR SetCriterion) with GuardedSetMatcher; returns the raw matcher."""
+    raw = criterion.matcher
+    if isinstance(raw, GuardedSetMatcher):
+        return raw.matcher
+    del criterion.matcher                       # an nn.Module child: remove it before setting a plain attribute
+    criterion.matcher = GuardedSetMatcher(raw)
+    return raw
+
+
+def take_match_guard_events() -> dict:
+    """Guard events since the last call (both matchers), for per-step logging; resets the event counters."""
+    out = {
+        "detr_match_sanitized": DETR_MATCH_GUARD_STATS["sanitized"],
+        "detr_match_fallback": DETR_MATCH_GUARD_STATS["fallback"],
+        "last_match_sanitized": MATCH_GUARD_STATS["sanitized"],
+        "last_match_fallback": MATCH_GUARD_STATS["fallback"],
+    }
+    for d in (DETR_MATCH_GUARD_STATS, MATCH_GUARD_STATS):
+        d["sanitized"] = 0
+        d["fallback"] = 0
+    return out
 
 
 def _build_rf_detr(config, detr_args):
@@ -243,6 +303,8 @@ def _build_rf_detr(config, detr_args):
 
     _rfdetr_crit, _ = _build_rfdetr_crit(rf_args)
     _rfdetr_crit.to(_torch.device(config["DEVICE"]))
+    # NaN guard on the criterion's own matcher (the raw matcher is kept for match_last_layer, which guards it itself).
+    _raw_matcher = install_criterion_match_guard(_rfdetr_crit)
 
     class _MotipCriterionWrapper:
         """Wraps RF-DETR SetCriterion to match MOTIP's (loss_dict, indices) interface.
@@ -255,9 +317,10 @@ def _build_rf_detr(config, detr_args):
         per-image assignments, independent of the group_detr=13 replication used
         for the loss.  The extra matcher call is cheap relative to the forward pass.
         """
-        def __init__(self, c, num_queries):
+        def __init__(self, c, num_queries, raw_matcher):
             self._c = c
             self._num_queries = num_queries
+            self._raw_matcher = raw_matcher
             self.weight_dict = c.weight_dict
 
         def __call__(self, outputs, targets, **kwargs):
@@ -272,7 +335,7 @@ def _build_rf_detr(config, detr_args):
                 "pred_logits": outputs["pred_logits"][:, :self._num_queries, :],
                 "pred_boxes":  outputs["pred_boxes"][:, :self._num_queries, :],
             }
-            return guarded_match(self._c.matcher, single, targets)
+            return guarded_match(self._raw_matcher, single, targets)
 
         def train(self, mode=True):
             self._c.train(mode)
@@ -289,7 +352,7 @@ def _build_rf_detr(config, detr_args):
         def parameters(self):
             return self._c.parameters()
 
-    detr_criterion = _MotipCriterionWrapper(_rfdetr_crit, num_queries=rf_args.num_queries)
+    detr_criterion = _MotipCriterionWrapper(_rfdetr_crit, num_queries=rf_args.num_queries, raw_matcher=_raw_matcher)
 
     return detr_model, detr_criterion
 
@@ -361,7 +424,18 @@ def build(config: dict):
             layers=config.get("LOOKAHEAD_LAYERS", None),
             geo_hidden=int(config.get("LOOKAHEAD_GEO_HIDDEN", 32)),
         ) if config.get("LOOKAHEAD", False) else None,
+        # Rink-distance attention bias (models/motip/rink_dist_bias.py), off by default.
+        rink_dist_bias=dict(
+            **({"knots_m": tuple(config["RINK_DIST_BIAS_KNOTS_M"])} if config.get("RINK_DIST_BIAS_KNOTS_M") else {}),
+            self_attn=bool(config.get("RINK_DIST_BIAS_SELF_ATTN", True)),
+        ) if config.get("RINK_DIST_BIAS", False) else None,
     ) if config["ONLY_DETR"] is False else None
+    if config.get("RINK_DIST_BIAS", False):
+        # Works with or without RINK_ANCHOR: the bias reads only the per-token feet XY (training: prepare_for_motip with the
+        # rink sidecar, gated by data.rink.needs_rink_data; inference: RuntimeTracker keeps the XY history whenever the
+        # model has the bias, from the per-frame homographies passed to update*(rink_H=)).
+        if config.get("LOOKAHEAD", False):
+            raise NotImplementedError("LOOKAHEAD does not carry rink XY for future tokens yet (RINK_DIST_BIAS).")
     if config.get("LOOKAHEAD", False) and (config.get("RINK_ANCHOR", False) or config.get("TEAM_CUE", False)):
         raise NotImplementedError("LOOKAHEAD does not carry rink XY / kit descriptors for future tokens yet.")
 
@@ -381,6 +455,7 @@ def build(config: dict):
             n_freq=config.get("RINK_ANCHOR_N_FREQ", 24),
             min_period_m=config.get("RINK_ANCHOR_MIN_PERIOD_M", 1.0),
             max_period_m=config.get("RINK_ANCHOR_MAX_PERIOD_M", 64.0),
+            out_scale_init=config.get("RINK_ANCHOR_OUT_SCALE_INIT", None),
         ),
         team_cue=config.get("TEAM_CUE", False),
         team_cue_kwargs=dict(
@@ -390,6 +465,11 @@ def build(config: dict):
             dropout=config.get("TEAM_CUE_DROPOUT", 0.1),
             noise_std=config.get("TEAM_CUE_NOISE", 0.0),
         ),
+        id_embed_head=dict(
+            in_dim=config["DETR_HIDDEN_DIM"],
+            hidden=int(config.get("ID_EMBED_HIDDEN", 256)),
+            out_dim=int(config.get("ID_EMBED_DIM", 128)),
+        ) if config.get("ID_EMBED_LOSS", False) else None,
     )
     # Store num_classes so RuntimeTracker can slice logits to the real class
     # channels (RF-DETR's build_model adds +1 for the background slot).
