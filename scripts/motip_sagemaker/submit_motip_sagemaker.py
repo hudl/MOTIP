@@ -433,7 +433,7 @@ model_trainer = ModelTrainer(
     checkpoint_config=checkpoint_config,
     role=ROLE,
     networking=networking_config,
-    tags=[{"key": "Squad", "value": "Faceoff"}],
+    tags=[{"key": "Squad", "value": "faceoff"}],
     environment={
         "MLFLOW_TRACKING_URI": "https://aml-mlflow.hudltools.com",
         "MLFLOW_EXPERIMENT_NAME": (
